@@ -5,3 +5,7 @@ COUCHDB_STDOUT_FILE=/dev/null
 COUCHDB_STDERR_FILE=/dev/null
 COUCHDB_RESPAWN_TIMEOUT=5
 COUCHDB_OPTIONS=
+
+# Set this option to 0 if you don't want CouchDB server to start
+# during system boot.
+ENABLE_SERVER=1

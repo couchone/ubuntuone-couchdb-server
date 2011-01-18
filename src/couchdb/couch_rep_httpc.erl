@@ -15,7 +15,8 @@
 -include("../ibrowse/ibrowse.hrl").
 
 -export([db_exists/1, db_exists/2, full_url/1, request/1, redirected_request/2,
-    spawn_worker_process/1, spawn_link_worker_process/1]).
+    redirect_url/2, spawn_worker_process/1, spawn_link_worker_process/1]).
+-export([ssl_options/1]).
 
 request(#http_db{} = Req) ->
     do_request(Req).
@@ -72,6 +73,7 @@ db_exists(Req, CanonicalUrl, CreateDB) ->
     #http_db{
         auth = Auth,
         headers = Headers0,
+        options = Options,
         url = Url
     } = Req,
     HeadersFun = fun(Method) ->
@@ -84,10 +86,10 @@ db_exists(Req, CanonicalUrl, CreateDB) ->
     end,
     case CreateDB of
         true ->
-            catch ibrowse:send_req(Url, HeadersFun(put), put);
+            catch ibrowse:send_req(Url, HeadersFun(put), put, [], Options);
         _Else -> ok
     end,
-    case catch ibrowse:send_req(Url, HeadersFun(head), head) of
+    case catch ibrowse:send_req(Url, HeadersFun(head), head, [], Options) of
     {ok, "200", _, _} ->
         Req#http_db{url = CanonicalUrl};
     {ok, "301", RespHeaders, _} ->
@@ -203,8 +205,7 @@ spawn_worker_process(Req) ->
     Pid.
 
 spawn_link_worker_process(Req) ->
-    Url = ibrowse_lib:parse_url(Req#http_db.url),
-    {ok, Pid} = ibrowse_http_client:start_link(Url),
+    {ok, Pid} = ibrowse:spawn_link_worker_process(Req#http_db.url),
     Pid.
 
 maybe_decompress(Headers, Body) ->
@@ -243,3 +244,52 @@ oauth_header(Url, QS, Action, Props) ->
     Params = oauth:signed_params(Method, Url, QSL, Consumer, Token, TokenSecret)
         -- QSL,
     {"Authorization", "OAuth " ++ oauth_uri:params_to_header_string(Params)}.
+
+ssl_options(#http_db{url = Url}) ->
+    case ibrowse_lib:parse_url(Url) of
+    #url{protocol = https} ->
+        start_ssl(),
+        Depth = list_to_integer(
+            couch_config:get("replicator", "ssl_certificate_max_depth", "3")
+        ),
+        SslOpts = [ {depth, Depth} |
+        case couch_config:get("replicator", "verify_ssl_certificates") of
+        "true" ->
+            ssl_verify_options(true);
+        _ ->
+            ssl_verify_options(false)
+        end ],
+        [{is_ssl, true}, {ssl_options, SslOpts}];
+    #url{protocol = http} ->
+        []
+    end.
+
+start_ssl() ->
+    start_ssl(erlang:system_info(otp_release)).
+
+start_ssl(OTPVersion) when OTPVersion < "R14A" ->
+    application:start(ssl);
+start_ssl(_OTPVersion) ->
+    application:start(crypto),
+    application:start(public_key),
+    application:start(ssl).
+
+ssl_verify_options(Value) ->
+    OTPVersion = erlang:system_info(otp_release),
+    case (OTPVersion >= "R13") andalso (OTPVersion < "R14") of
+    true ->
+        [{ssl_imp, new}];
+    false ->
+        []
+    end ++ ssl_verify_options(Value, OTPVersion).
+
+ssl_verify_options(true, OTPVersion) when OTPVersion >= "R13" ->
+    CAFile = couch_config:get("replicator", "ssl_trusted_certificates_file"),
+    [{verify, verify_peer}, {cacertfile, CAFile}];
+ssl_verify_options(false, OTPVersion) when OTPVersion >= "R13" ->
+    [{verify, verify_none}];
+ssl_verify_options(true, _OTPVersion) ->
+    CAFile = couch_config:get("replicator", "ssl_trusted_certificates_file"),
+    [{verify, 2}, {cacertfile, CAFile}];
+ssl_verify_options(false, _OTPVersion) ->
+    [{verify, 0}].

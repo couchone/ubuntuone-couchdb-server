@@ -64,8 +64,19 @@ handle_utils_dir_req(#httpd{method='GET'}=Req, DocumentRoot) ->
 handle_utils_dir_req(Req, _) ->
     send_method_not_allowed(Req, "GET,HEAD").
 
-handle_all_dbs_req(#httpd{method='GET'}=Req) ->
-    {ok, DbNames} = couch_server:all_databases(),
+handle_all_dbs_req(#httpd{method='GET', user_ctx=UserCtx}=Req) ->
+    {ok, DbNames} = case lists:member(<<"_admin">>, UserCtx#user_ctx.roles) of
+    true ->
+        couch_server:all_databases();
+    false ->
+        case UserCtx#user_ctx.name of
+        null ->
+            {ok, []};
+        UserName ->
+            UserPrefix = couch_httpd_auth:username_to_prefix(UserName),
+            couch_server:all_databases(?b2l(UserPrefix))
+        end
+    end,
     send_json(Req, DbNames);
 handle_all_dbs_req(Req) ->
     send_method_not_allowed(Req, "GET,HEAD").
@@ -93,7 +104,12 @@ handle_replicate_req(#httpd{method='POST'}=Req) ->
     {error, not_found} ->
         send_json(Req, 404, {[{error, not_found}]});
     {error, Reason} ->
-        send_json(Req, 500, {[{error, Reason}]})
+        try
+            send_json(Req, 500, {[{error, Reason}]})
+        catch
+        exit:{json_encode, _} ->
+            send_json(Req, 500, {[{error, couch_util:to_binary(Reason)}]})
+        end
     catch
     throw:{db_not_found, Msg} ->
         send_json(Req, 404, {[{error, db_not_found}, {reason, Msg}]})

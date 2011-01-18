@@ -320,7 +320,7 @@ get_security(#db{security=SecProps}) ->
     {SecProps}.
 
 set_security(#db{update_pid=Pid}=Db, {NewSecProps}) when is_list(NewSecProps) ->
-    check_is_admin(Db),
+    ok = couch_httpd_auth:verify_permission(Db#db.name, Db#db.user_ctx),
     ok = validate_security_object(NewSecProps),
     ok = gen_server:call(Pid, {set_security, NewSecProps}, infinity),
     {ok, _} = ensure_full_commit(Db),
@@ -404,13 +404,25 @@ group_alike_docs([Doc|Rest], [Bucket|RestBuckets]) ->
        group_alike_docs(Rest, [[Doc]|[Bucket|RestBuckets]])
     end.
 
-validate_doc_update(#db{}=Db, #doc{id= <<"_design/",_/binary>>}, _GetDiskDocFun) ->
-    catch check_is_admin(Db);
+validate_doc_update(#db{}=Db, #doc{id= <<"_design/",_/binary>>}=Doc, GetDiskDocFun) ->
+    case (catch check_is_admin(Db)) of
+    % Admins can update design docs
+    ok -> ok;
+    Error ->
+        % run validation functions against the design doc (if enabled in config)
+        case couch_config:get("couchdb", "validate_design_docs") of
+        "true" -> validate_doc_update0(Db, Doc, GetDiskDocFun);
+        _ -> Error
+        end
+    end;
 validate_doc_update(#db{validate_doc_funs=[]}, _Doc, _GetDiskDocFun) ->
     ok;
 validate_doc_update(_Db, #doc{id= <<"_local/",_/binary>>}, _GetDiskDocFun) ->
     ok;
 validate_doc_update(Db, Doc, GetDiskDocFun) ->
+    validate_doc_update0(Db, Doc, GetDiskDocFun).
+
+validate_doc_update0(Db, Doc, GetDiskDocFun) ->
     DiskDoc = GetDiskDocFun(),
     JsonCtx = couch_util:json_user_ctx(Db),
     SecObj = get_security(Db),

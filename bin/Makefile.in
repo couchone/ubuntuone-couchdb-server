@@ -244,7 +244,7 @@ noinst_SCRIPTS = couchjs_dev
 CLEANFILES = $(bin_SCRIPTS) $(dist_man1_MANS) $(noinst_SCRIPTS)
 couchdb_command_name = `echo couchdb | sed '$(transform)'`
 couchjs_command_name = `echo couchjs | sed '$(transform)'`
-HELP2MAN_OPTION = --no-info --help-option="-h" --version-option="-V"
+HELP2MAN_OPTION = --no-info --no-discard-stderr --help-option="-h" --version-option="-V"
 all: all-am
 
 .SUFFIXES:

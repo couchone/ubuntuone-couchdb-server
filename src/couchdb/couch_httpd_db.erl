@@ -170,9 +170,10 @@ handle_design_info_req(Req, _Db, _DDoc) ->
     send_method_not_allowed(Req, "GET").
 
 create_db_req(#httpd{user_ctx=UserCtx}=Req, DbName) ->
-    ok = couch_httpd:verify_is_server_admin(Req),
+    ok = couch_httpd_auth:verify_permission(DbName, UserCtx),
     case couch_server:create(DbName, [{user_ctx, UserCtx}]) of
     {ok, Db} ->
+        ok = set_default_db_security(Db, UserCtx),
         couch_db:close(Db),
         DbUrl = absolute_uri(Req, "/" ++ couch_util:url_encode(DbName)),
         send_json(Req, 201, [{"Location", DbUrl}], {[{ok, true}]});
@@ -180,8 +181,26 @@ create_db_req(#httpd{user_ctx=UserCtx}=Req, DbName) ->
         throw(Error)
     end.
 
+set_default_db_security(_Db, #user_ctx{name = null}) ->
+    ok;
+set_default_db_security(Db, #user_ctx{name = UserName, roles = Roles}) ->
+    case lists:member(<<"_admin">>, Roles) of
+    true ->
+        ok;
+    false ->
+        SecObj = {[
+            {<<"admins">>, {[
+                {<<"names">>, [UserName]}
+            ]}},
+            {<<"readers">>, {[
+                {<<"names">>, [UserName]}
+            ]}}
+        ]},
+        ok = couch_db:set_security(Db, SecObj)
+    end.
+
 delete_db_req(#httpd{user_ctx=UserCtx}=Req, DbName) ->
-    ok = couch_httpd:verify_is_server_admin(Req),
+    ok = couch_httpd_auth:verify_permission(DbName, UserCtx),
     case couch_server:delete(DbName, [{user_ctx, UserCtx}]) of
     ok ->
         send_json(Req, 200, {[{ok, true}]});

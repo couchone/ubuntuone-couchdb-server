@@ -130,6 +130,7 @@ nobase_dist_localdata_DATA = \
     www/script/test/copy_doc.js \
     www/script/test/delayed_commits.js \
     www/script/test/design_docs.js \
+    www/script/test/design_docs_validation.js \
     www/script/test/design_options.js \
     www/script/test/design_paths.js \
     www/script/test/erlang_views.js \
@@ -147,6 +148,7 @@ nobase_dist_localdata_DATA = \
     www/script/test/method_override.js \
     www/script/test/multiple_rows.js \
     www/script/test/oauth.js \
+    www/script/test/oauth_users_db.js \
     www/script/test/proxyauth.js \
     www/script/test/purge.js \
     www/script/test/reader_acl.js \
@@ -163,6 +165,7 @@ nobase_dist_localdata_DATA = \
     www/script/test/stats.js \
     www/script/test/update_documents.js \
     www/script/test/users_db.js \
+    www/script/test/user_prefixes.js \
     www/script/test/utf8.js \
     www/script/test/uuids.js \
     www/script/test/view_collation.js \

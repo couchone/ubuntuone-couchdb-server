@@ -19,6 +19,7 @@
 -export([proxy_authentification_handler/1]).
 -export([cookie_auth_header/2]).
 -export([handle_session_req/1]).
+-export([verify_permission/2, username_to_prefix/1]).
 
 -import(couch_httpd, [header_value/2, send_json/2,send_json/4, send_method_not_allowed/2]).
 
@@ -347,3 +348,30 @@ to_int(Value) when is_integer(Value) ->
 make_cookie_time() ->
     {NowMS, NowS, _} = erlang:now(),
     NowMS * 1000000 + NowS.
+
+username_to_prefix(UserName) ->
+    NameSize = size(UserName),
+    NameMd5 = ?l2b(couch_util:to_hex(couch_util:md5(UserName))),
+    <<NameMd5_0:3/binary, NameMd5_1:3/binary, _/binary>> = NameMd5,
+    <<"u/", NameMd5_0:3/binary, "/", NameMd5_1:3/binary, "/",
+        UserName:NameSize/binary, "/">>.
+
+verify_permission(DbName, #user_ctx{name = Name, roles = Roles}) ->
+    case lists:member(<<"_admin">>, Roles) of
+    true ->
+        ok;
+    false->
+        case Name of
+        null ->
+            throw({unauthorized, "Please authenticate."});
+        UserName when is_binary(UserName) ->
+            Prefix = username_to_prefix(UserName),
+            PrefixSize = size(Prefix),
+            case DbName of
+            <<Prefix:PrefixSize/binary, _Suffix/binary>> ->
+                ok;
+            _ ->
+                throw({forbidden, "Access denied."})
+            end
+        end
+    end.

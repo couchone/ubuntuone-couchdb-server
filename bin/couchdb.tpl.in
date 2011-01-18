@@ -36,6 +36,13 @@ print_arguments=""
 start_arguments=""
 background_start_arguments=""
 
+if test -n "$LD_LIBRARY_PATH"; then
+ LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/xulrunner-`xulrunner-1.9.2 --gre-version`/
+else
+ LD_LIBRARY_PATH=/usr/lib/xulrunner-`xulrunner-1.9.2 --gre-version`/
+fi
+export LD_LIBRARY_PATH
+
 basename=`basename $0`
 
 display_version () {

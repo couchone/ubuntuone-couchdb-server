@@ -354,15 +354,9 @@ close_db(Db) ->
     couch_db:close(Db).
 
 dbname(#http_db{url = Url}) ->
-    strip_password(Url);
+    couch_util:url_strip_password(Url);
 dbname(#db{name = Name}) ->
     Name.
-
-strip_password(Url) ->
-    re:replace(Url,
-        "http(s)?://([^:]+):[^@]+@(.*)$",
-        "http\\1://\\2:*****@\\3",
-        [{return, list}]).
 
 dbinfo(#http_db{} = Db) ->
     {DbProps} = couch_rep_httpc:request(Db),
@@ -499,7 +493,7 @@ get_rep_endpoint(UserCtx, <<DbName/binary>>) ->
 
 open_replication_log(#http_db{}=Db, RepId) ->
     DocId = ?LOCAL_DOC_PREFIX ++ RepId,
-    Req = Db#http_db{resource=couch_util:url_encode(DocId)},
+    Req = Db#http_db{resource=couch_util:encode_doc_id(DocId)},
     case couch_rep_httpc:request(Req) of
     {[{<<"error">>, _}, {<<"reason">>, _}]} ->
         ?LOG_DEBUG("didn't find a replication log for ~s", [Db#http_db.url]),
@@ -533,7 +527,10 @@ open_db({Props}, _UserCtx, ProxyParams, CreateTarget) ->
         auth = AuthProps,
         headers = lists:ukeymerge(1, Headers, DefaultHeaders)
     },
-    Db = Db1#http_db{options = Db1#http_db.options ++ ProxyParams},
+    Db = Db1#http_db{
+        options = Db1#http_db.options ++ ProxyParams ++
+                    couch_rep_httpc:ssl_options(Db1)
+    },
     couch_rep_httpc:db_exists(Db, CreateTarget);
 open_db(<<"http://",_/binary>>=Url, _, ProxyParams, CreateTarget) ->
     open_db({[{<<"url">>,Url}]}, [], ProxyParams, CreateTarget);
@@ -712,7 +709,7 @@ ensure_full_commit(Source, RequiredSeq) ->
 
 update_local_doc(#http_db{} = Db, #doc{id=DocId} = Doc) ->
     Req = Db#http_db{
-        resource = couch_util:url_encode(DocId),
+        resource = couch_util:encode_doc_id(DocId),
         method = put,
         body = couch_doc:to_json_obj(Doc, [attachments]),
         headers = [{"x-couch-full-commit", "false"} | Db#http_db.headers]

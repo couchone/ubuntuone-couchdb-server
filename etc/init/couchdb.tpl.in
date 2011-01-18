@@ -33,8 +33,12 @@ CONFIGURATION_FILE=%sysconfdir%/default/couchdb
 RUN_DIR=%localstaterundir%
 LSB_LIBRARY=/lib/lsb/init-functions
 
+# Grace time in seconds to give the beam process to stop when we're running the
+# stop target. Will end before grace time ends if the process ends sooner.
+STOP_GRACE_TIME=5
+
 if test ! -x $COUCHDB; then
-    exit $SCRIPT_ERROR
+    exit $SCRIPT_OK
 fi
 
 if test -r $CONFIGURATION_FILE; then
@@ -60,6 +64,15 @@ if test -r $LSB_LIBRARY; then
     . $LSB_LIBRARY
 fi
 
+if test "$ENABLE_SERVER" = "0"; then
+    case "$1" in
+        start|restart|force-reload)
+            echo "Database server $NAME is disabled in $CONFIGURATION_FILE."
+            exit $SCRIPT_OK
+            ;;
+    esac
+fi
+
 start_couchdb () {
     # Start Apache CouchDB as a background process.
 
@@ -77,6 +90,7 @@ start_couchdb () {
         command="$command $COUCHDB_OPTIONS"
     fi
     mkdir -p "$RUN_DIR"
+    cd "$RUN_DIR"
     if test -n "$COUCHDB_USER"; then
         chown $COUCHDB_USER "$RUN_DIR"
         if su $COUCHDB_USER -c "$command" > /dev/null; then
@@ -96,23 +110,50 @@ start_couchdb () {
 stop_couchdb () {
     # Stop the running Apache CouchDB process.
 
+    pidFile="$RUN_DIR/couchdb.pid"
+    if [ ! -r "$pidFile" ] 
+    then
+        #exists, but can't read it 
+        [ -f "$pidFile" ] && return $SCRIPT_ERROR
+
+        #doesn't exist, so assume couchdb is already stopped
+        return $SCRIPT_OK
+    fi
+
+    pid=`cat $pidFile` 
+    #unset $pidFile 
+    [ -z "$pid" ] && return $SCRIPT_OK
+
     command="$COUCHDB -d"
     if test -n "$COUCHDB_OPTIONS"; then
         command="$command $COUCHDB_OPTIONS"
     fi
+
+    # We need `heart`'s pid because its ppid is set to 1 when the beam proc
+    # ends, thereby hiding itself from our `ps` check bellow.
+    heart_pid=`ps -f --ppid $pid | grep "heart -pid $pid " | awk '{print $2}'`
+    [ -n "$heart_pid" ] && heart_pid=",$heart_pid" #for `ps` call formatting
+
     if test -n "$COUCHDB_USER"; then
-        if su $COUCHDB_USER -c "$command" > /dev/null; then
-            return $SCRIPT_OK
-        else
+        if ! su $COUCHDB_USER -c "$command" > /dev/null; then
             return $SCRIPT_ERROR
         fi
     else
-        if $command > /dev/null; then
-            return $SCRIPT_OK
-        else
+        if ! $command > /dev/null; then
             return $SCRIPT_ERROR
         fi
     fi
+
+    i=0
+    while ps -p $pid$heart_pid --ppid $pid$heart_pid > /dev/null 
+    do
+        [ $i -ge $STOP_GRACE_TIME ] && return $SCRIPT_ERROR
+
+        sleep 1
+        i=`expr $i + 1`
+    done
+
+    return $SCRIPT_OK
 }
 
 display_status () {
@@ -141,7 +182,7 @@ parse_script_option_list () {
                 log_end_msg $SCRIPT_ERROR
             fi
             ;;
-        restart)
+        restart|force-reload)
             log_daemon_msg "Restarting $DESCRIPTION" $NAME
             if stop_couchdb; then
                 if start_couchdb; then
@@ -158,7 +199,7 @@ parse_script_option_list () {
             ;;
         *)
             cat << EOF >&2
-Usage: $SCRIPT_NAME {start|stop|restart|status}
+Usage: $SCRIPT_NAME {start|stop|restart|force-reload|status}
 EOF
             exit $SCRIPT_ERROR
             ;;
