@@ -32,6 +32,55 @@ couchTests.oauth_users_db = function(debug) {
     return secret;
   }
 
+  var fdmanana = CouchDB.prepareUserDoc({
+    name: "fdmanana",
+    roles: ["dev"],
+    oauth: {
+      consumer_keys: {
+        "key_foo": "bar",
+        "key_xpto": "mars"
+      },
+      tokens: {
+        "salut": "ola",
+        "tok1": "123"
+      }
+    }
+  }, "qwerty");
+
+  var joe = CouchDB.prepareUserDoc({
+    name: "joe",
+    roles: ["erlanger"],
+    oauth: {
+      consumer_keys: {
+        "key_foo_2": "bar2",
+        "key_xpto_2": "mars2"
+      },
+      tokens: {
+        "salut_2": "ola2",
+        "tok2": "666"
+      }
+    }
+  }, "functional");
+
+
+  // computed in Erlang with couch_util:to_hex(couch_util:md5(UserName))
+  // (there's no JavaScript MD5 lib shipped with CouchDB)
+  var user_hashes = {
+    "joe":  "8ff32489f92f33416694be8fdc2d4c22",
+    "fdmanana": "9ecd64427022200cfe955884e6d68678"
+  };
+
+  function userPrefix(username) {
+    // same computation as couch_httpd_auth:username_to_prefix/1
+    var p0 = user_hashes[username].substr(0, 3);
+    var p1 = user_hashes[username].substr(3, 3);
+    return "u/" + p0 + "/" + p1 + "/" + username + "/";
+  }
+
+  function dbPath(username, dbname) {
+    return userPrefix(username) + dbname;
+  }
+
 
   function oauthRequest(method, path, message, accessor) {
     message.action = path;
@@ -55,22 +104,8 @@ couchTests.oauth_users_db = function(debug) {
   }
 
 
-  // this function will be called on the modified server
-  var testFun = function () {
-    var fdmanana = CouchDB.prepareUserDoc({
-      name: "fdmanana",
-      roles: ["dev"],
-      oauth: {
-        consumer_keys: {
-          "key_foo": "bar",
-          "key_xpto": "mars"
-        },
-        tokens: {
-          "salut": "ola",
-          "tok1": "123"
-        }
-      }
-    }, "qwerty");
+  var loginTestFun = function () {
+    delete fdmanana._rev;
     T(usersDb.save(fdmanana).ok);
 
     var signatureMethods = ["PLAINTEXT", "HMAC-SHA1"];
@@ -134,24 +169,115 @@ couchTests.oauth_users_db = function(debug) {
   };
 
 
-  usersDb.deleteDb();
+  function populate_db(db, docs) {
+    for (var i = 0; i < docs.length; i++) {
+      var d = docs[i];
+      delete d._rev;
+      T(db.save(d).ok);
+    }
+  }
 
-  run_on_modified_server(
-    [
-     {section: "httpd",
-      key: "WWW-Authenticate", value: 'OAuth'},
-     {section: "couch_httpd_auth",
-      key: "secret", value: generateSecret(64)},
-     {section: "couch_httpd_auth",
-      key: "authentication_db", value: usersDb.name},
-     {section: "couch_httpd_oauth",
-      key: "use_user_db", value: "true"},
-     {section: "httpd", key: "authentication_handlers",
-      value: "{couch_httpd_oauth, oauth_authentication_handler}, " +
-        "{couch_httpd_auth, default_authentication_handler}"}
-    ],
-    testFun
-  );
+  var replicationTestFun = function() {
+    var host = CouchDB.host;
+    var dbA = new CouchDB("test_suite_db_a", {"X-Couch-Full-Commit": "false"});
+    var dbB = new CouchDB("test_suite_db_b", {"X-Couch-Full-Commit": "false"});
+    var docs = makeDocs(0, 5);
+
+    delete fdmanana._rev;
+    delete joe._rev;
+    T(usersDb.save(fdmanana).ok);
+    T(usersDb.save(joe).ok);
+
+    var repObj = {
+      source: dbA.name,
+      target: {
+        url: 'http://' + host + '/' +
+          encodeURIComponent(dbPath("fdmanana", dbB.name)),
+        auth: {
+          oauth: {
+            consumer_secret: "bar",
+            consumer_key: "key_foo",
+            token_secret: "ola",
+            token: "salut"
+          }
+        }
+      }
+    };
+
+    var src = new CouchDB(dbA.name);
+    src.deleteDb();
+    T(src.createDb().ok);
+    populate_db(src, docs);
+
+    T(CouchDB.login("fdmanana", "qwerty").ok);
+    var tgt = new CouchDB(dbPath("fdmanana", dbB.name));
+    tgt.deleteDb();
+    T(tgt.createDb().ok);
+    CouchDB.logout();
+
+    var repResult = CouchDB.replicate(repObj.source, repObj.target);
+    T(repResult.ok === true);
+
+    for (var i = 0; i < docs.length; i++) {
+      var copy = tgt.open(docs[i]._id);
+      T(copy !== null);
+    }
+
+    src.deleteDb();
+    tgt.deleteDb();
+
+    // test replication failure (wrong user OAuth credentials)
+    T(src.createDb().ok);
+    populate_db(src, docs);
+
+    T(CouchDB.login("joe", "functional").ok);
+    tgt = new CouchDB(dbPath("joe", dbB.name));
+    tgt.deleteDb();
+    T(tgt.createDb().ok);
+    CouchDB.logout();
+
+    repObj.target.url = 'http://' + host + '/' +
+        encodeURIComponent(dbPath("joe", dbB.name));
+
+    try {
+      CouchDB.replicate(repObj.source, repObj.target);
+      T(false, "replication should have failed");
+    } catch (x) {
+      TEquals("string", typeof x.error, "got an error when pull replicating");
+    }
+
+    src.deleteDb();
+    tgt.deleteDb();
+  };
+
+
+  var server_config = [
+    {
+      section: "httpd",
+      key: "WWW-Authenticate",
+      value: 'OAuth'
+    },
+    {
+      section: "couch_httpd_auth",
+      key: "secret",
+      value: generateSecret(64)
+    },
+    {
+      section: "couch_httpd_auth",
+      key: "authentication_db",
+      value: usersDb.name
+    },
+    {
+      section: "couch_httpd_oauth",
+      key: "use_user_db",
+      value: "true"
+    }
+  ];
+
+  usersDb.deleteDb();
+  run_on_modified_server(server_config, loginTestFun);
+  usersDb.deleteDb();
+  run_on_modified_server(server_config, replicationTestFun);
 
   // cleanup
   usersDb.deleteDb();
