@@ -218,7 +218,8 @@ consumer_key_secret(Key) ->
             ?b2l(Sec);
         Secs ->
             Reason = iolist_to_binary(
-                io_lib:format("Consumer key ~s is referenced by ~p user docs",
+                io_lib:format("Can't map OAuth consumer key ~s to a single user "
+                    "document. It is referenced by ~p user documents.",
                     [Key, length(Secs)])),
             ?LOG_ERROR("~s", [Reason]),
             {error, {<<"oauth_consumer_key">>, Reason}}
@@ -241,7 +242,8 @@ access_token_info(Token) ->
         Secrets ->
             UserList = [?b2l(U) || [_, U | _] <- Secrets],
             Reason = iolist_to_binary(
-                io_lib:format("OAuth token ~s is shared by multiple users: ~s",
+                io_lib:format("Can't map OAuth token ~s to a single user "
+                    "document. It is mapped to the following users: ~s.",
                     [Token, string:join(UserList, ", ")])),
             ?LOG_ERROR("~s", [Reason]),
             {error, {<<"oauth_token">>, Reason}}
