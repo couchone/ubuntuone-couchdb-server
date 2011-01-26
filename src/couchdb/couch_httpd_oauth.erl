@@ -16,37 +16,46 @@
 -export([oauth_authentication_handler/1, handle_oauth_req/1, consumer_lookup/2]).
 
 % OAuth auth handler using per-node user db
-oauth_authentication_handler(#httpd{mochi_req=MochiReq}=Req) ->
+oauth_authentication_handler(Req) ->
     serve_oauth(Req, fun(URL, Params, Consumer, Signature) ->
         AccessToken = couch_util:get_value("oauth_token", Params),
-        [TokenSecret, Username, DelegationRoles] =
         case access_token_info(AccessToken) of
+        {error, {Error, Reason}} ->
+            couch_httpd:send_error(Req, 400, Error, Reason);
+        [undefined, _ | _] ->
+            couch_httpd:send_error(
+                Req, 400, <<"invalid_token">>, <<"Invalid OAuth token.">>);
         [Ts, User] ->
-            [Ts, User, undefined];
+            validate_token_secret(
+                Req, [Ts, User, undefined], URL, Params, Consumer, Signature);
         [_, _, _] = Delegation ->
-            Delegation
-        end,
-        case TokenSecret of
-            undefined ->
-                couch_httpd:send_error(Req, 400, <<"invalid_token">>,
-                    <<"Invalid OAuth token.">>);
-            _Secret ->
-                ?LOG_DEBUG("OAuth URL is: ~p", [URL]),
-                case oauth:verify(Signature, atom_to_list(MochiReq:get(method)), URL, Params, Consumer, TokenSecret) of
-                    true ->
-                        set_user_ctx(Req, Username, DelegationRoles);
-                    false ->
-                        ?LOG_DEBUG("OAuth handler: signature verification failed for user ~p", [Username]),
-                        ?LOG_DEBUG("OAuth handler: received signature ~p", [Signature]),
-                        ?LOG_DEBUG("OAuth handler: HTTP method ~p", [MochiReq:get(method)]),
-                        ?LOG_DEBUG("OAuth handler: URL ~p", [URL]),
-                        ?LOG_DEBUG("OAuth handler: Parameters ~p", [Params]),
-                        ?LOG_DEBUG("OAuth handler: Consumer ~p, TokenSecret ~p", [Consumer, TokenSecret]),
-                        ?LOG_DEBUG("OAuth handler: expected signature ~p", [oauth:signature(atom_to_list(MochiReq:get(method)), URL, Params, Consumer, TokenSecret)]),
-                        Req
-                end
+            validate_token_secret(
+                Req, Delegation, URL, Params, Consumer, Signature)
         end
     end, true).
+
+validate_token_secret(
+        #httpd{mochi_req = MochiReq} = Req,
+        [TokenSecret, Username, DelegationRoles],
+        URL, Params, Consumer, Signature) ->
+    case oauth:verify(Signature, atom_to_list(MochiReq:get(method)),
+        URL, Params, Consumer, TokenSecret) of
+    true ->
+        set_user_ctx(Req, Username, DelegationRoles);
+    false ->
+        ?LOG_DEBUG("OAuth handler: signature verification failed for user ~p",
+            [Username]),
+        ?LOG_DEBUG("OAuth handler: received signature ~p", [Signature]),
+        ?LOG_DEBUG("OAuth handler: HTTP method ~p", [MochiReq:get(method)]),
+        ?LOG_DEBUG("OAuth handler: URL ~p", [URL]),
+        ?LOG_DEBUG("OAuth handler: Parameters ~p", [Params]),
+        ?LOG_DEBUG("OAuth handler: Consumer ~p, TokenSecret ~p",
+            [Consumer, TokenSecret]),
+        ?LOG_DEBUG("OAuth handler: expected signature ~p",
+            [oauth:signature(atom_to_list(MochiReq:get(method)),
+                URL, Params, Consumer, TokenSecret)]),
+        Req
+    end.
 
 % Look up the consumer key and get the roles to give the consumer
 set_user_ctx(_Req, undefined, _DelegationRoles) ->
@@ -162,6 +171,8 @@ serve_oauth(#httpd{mochi_req=MochiReq}=Req, Fun, FailSilently) ->
                     case consumer_lookup(ConsumerKey, SigMethod) of
                         none ->
                             couch_httpd:send_error(Req, 400, <<"invalid_consumer">>, <<"Invalid consumer (key or signature method).">>);
+                        {error, {Error, Reason}} ->
+                            couch_httpd:send_error(Req, 400, Error, Reason);
                         Consumer ->
                             Signature = couch_util:get_value("oauth_signature", Params),
                             URL = couch_httpd:absolute_uri(Req, MochiReq:get(raw_path)),
@@ -185,6 +196,7 @@ consumer_lookup(Key, MethodStr) ->
         _SupportedMethod ->
             case consumer_key_secret(Key) of
                 undefined -> none;
+                {error, _} = Err -> Err;
                 Secret -> {Key, Secret, SignatureMethod}
             end
     end.
@@ -200,10 +212,16 @@ consumer_key_secret(Key) ->
     {ok, Db} ->
         Secret =
         case query_map_view(Db, ?DDOC_ID, <<"consumer_key_secret">>, Key) of
-        undefined ->
+        [] ->
             undefined;
-        Sec ->
-            ?b2l(Sec)
+        [Sec] ->
+            ?b2l(Sec);
+        Secs ->
+            Reason = iolist_to_binary(
+                io_lib:format("Consumer key ~s is referenced by ~p user docs",
+                    [Key, length(Secs)])),
+            ?LOG_ERROR("~s", [Reason]),
+            {error, {<<"oauth_consumer_key">>, Reason}}
         end,
         couch_db:close(Db),
         Secret;
@@ -216,10 +234,17 @@ access_token_info(Token) ->
     {ok, Db} ->
         Info =
         case query_map_view(Db, ?DDOC_ID, <<"access_token_info">>, Token) of
-        undefined ->
+        [] ->
             [undefined, undefined];
-        [TokenSecret, Username | DelegatedRoles] ->
-            [?b2l(TokenSecret), ?b2l(Username) | DelegatedRoles]
+        [[TokenSecret, Username | DelegatedRoles]] ->
+            [?b2l(TokenSecret), ?b2l(Username) | DelegatedRoles];
+        Secrets ->
+            UserList = [?b2l(U) || [_, U | _] <- Secrets],
+            Reason = iolist_to_binary(
+                io_lib:format("OAuth token ~s is shared by multiple users: ~s",
+                    [Token, string:join(UserList, ", ")])),
+            ?LOG_ERROR("~s", [Reason]),
+            {error, {<<"oauth_token">>, Reason}}
         end,
         couch_db:close(Db),
         Info;
@@ -321,23 +346,16 @@ access_token_info_map_fun() ->
 query_map_view(Db, DesignId, ViewName, Key1) ->
     Key = ?l2b(Key1),
     {ok, View, _Group} = couch_view:get_map_view(Db, DesignId, ViewName, nil),
-    FoldlFun = fun({{Key0, _DocId}, Value}, _, Acc) ->
-        case Key0 =:= Key of
-        true ->
-            {stop, Value};
-        false ->
-            {ok, Acc}
-        end
+    FoldlFun = fun({_Key_DocId, Value}, _, Acc) ->
+        {ok, [Value | Acc]}
     end,
     ViewOptions = [
         {start_key, {Key, ?MIN_STR}},
         {end_key, {Key, ?MAX_STR}}
     ],
-    case couch_view:fold(View, FoldlFun, nil, ViewOptions) of
-    {ok, _, nil} ->
-        undefined;
+    case couch_view:fold(View, FoldlFun, [], ViewOptions) of
     {ok, _, Result} ->
         Result;
     _ ->
-        undefined
+        []
     end.

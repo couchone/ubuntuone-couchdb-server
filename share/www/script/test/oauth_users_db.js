@@ -251,6 +251,84 @@ couchTests.oauth_users_db = function(debug) {
   };
 
 
+  function duplicateCredentialsTest() {
+    var oauth_msg, oauth_accessor;
+    var xhr, data;
+
+    delete fdmanana._rev;
+    T(usersDb.save(fdmanana).ok);
+
+    oauth_msg = {
+      parameters: {
+        oauth_signature_method: "HMAC-SHA1",
+        oauth_consumer_key: "key_foo",
+        oauth_token: "tok1",
+        oauth_version: "1.0"
+      }
+    };
+    oauth_accessor = {
+      consumerSecret: "bar",
+      tokenSecret: "123"
+    };
+
+    xhr = oauthRequest(
+      "GET", "http://" + host + "/_session", oauth_msg, oauth_accessor);
+    TEquals(200, xhr.status);
+    data = JSON.parse(xhr.responseText);
+    TEquals(true, data.ok);
+    TEquals("object", typeof data.userCtx);
+    TEquals("fdmanana", data.userCtx.name);
+    TEquals("dev", data.userCtx.roles[0]);
+    TEquals("oauth", data.info.authenticated);
+
+    // a different user doc, also with the consumer "key_foo" but with a
+    // different consumer secret -> should lead to an error
+    var hulk = CouchDB.prepareUserDoc({
+      name: "hulk",
+      roles: ["destroyer", "foo"],
+      oauth: {
+        consumer_keys: {
+          "key_foo": "other_bar"
+        },
+        tokens: {
+          "green": "muscles"
+        }
+      }
+    }, "321");
+    T(usersDb.save(hulk).ok);
+
+    xhr = oauthRequest(
+      "GET", "http://" + host + "/_session", oauth_msg, oauth_accessor);
+    TEquals(400, xhr.status);
+    data = JSON.parse(xhr.responseText);
+    TEquals("oauth_consumer_key", data.error);
+
+    T(usersDb.deleteDoc(hulk));
+
+    // a different user doc, also with the token "tok1" but with a different
+    // token secret -> should lead to an error
+    var ironMan = CouchDB.prepareUserDoc({
+      name: "iron",
+      roles: ["foobar"],
+      oauth: {
+        consumer_keys: {
+          "iron_consumer": "steel"
+        },
+        tokens: {
+          "tok1": "different_secret"
+        }
+      }
+    }, "rusty");
+    T(usersDb.save(ironMan).ok);
+
+    xhr = oauthRequest(
+      "GET", "http://" + host + "/_session", oauth_msg, oauth_accessor);
+    TEquals(400, xhr.status);
+    data = JSON.parse(xhr.responseText);
+    TEquals("oauth_token", data.error);
+  }
+
+
   var server_config = [
     {
       section: "httpd",
@@ -278,6 +356,8 @@ couchTests.oauth_users_db = function(debug) {
   run_on_modified_server(server_config, loginTestFun);
   usersDb.deleteDb();
   run_on_modified_server(server_config, replicationTestFun);
+  usersDb.deleteDb();
+  run_on_modified_server(server_config, duplicateCredentialsTest);
 
   // cleanup
   usersDb.deleteDb();
