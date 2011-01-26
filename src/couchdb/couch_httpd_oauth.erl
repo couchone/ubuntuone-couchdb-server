@@ -19,7 +19,13 @@
 oauth_authentication_handler(#httpd{mochi_req=MochiReq}=Req) ->
     serve_oauth(Req, fun(URL, Params, Consumer, Signature) ->
         AccessToken = couch_util:get_value("oauth_token", Params),
-        [TokenSecret, Username] = access_token_info(AccessToken),
+        [TokenSecret, Username, DelegationRoles] =
+        case access_token_info(AccessToken) of
+        [Ts, User] ->
+            [Ts, User, undefined];
+        [_, _, _] = Delegation ->
+            Delegation
+        end,
         case TokenSecret of
             undefined ->
                 couch_httpd:send_error(Req, 400, <<"invalid_token">>,
@@ -28,7 +34,7 @@ oauth_authentication_handler(#httpd{mochi_req=MochiReq}=Req) ->
                 ?LOG_DEBUG("OAuth URL is: ~p", [URL]),
                 case oauth:verify(Signature, atom_to_list(MochiReq:get(method)), URL, Params, Consumer, TokenSecret) of
                     true ->
-                        set_user_ctx(Req, Username);
+                        set_user_ctx(Req, Username, DelegationRoles);
                     false ->
                         ?LOG_DEBUG("OAuth handler: signature verification failed for user ~p", [Username]),
                         ?LOG_DEBUG("OAuth handler: received signature ~p", [Signature]),
@@ -43,11 +49,9 @@ oauth_authentication_handler(#httpd{mochi_req=MochiReq}=Req) ->
     end, true).
 
 % Look up the consumer key and get the roles to give the consumer
-set_user_ctx(Req, Name) ->
-    case Name of
-        undefined -> throw({bad_request, unknown_oauth_token});
-        _ -> ok
-    end,
+set_user_ctx(_Req, undefined, _DelegationRoles) ->
+    throw({bad_request, unknown_oauth_token});
+set_user_ctx(Req, Name, undefined) ->
     case couch_auth_cache:get_user_creds(Name) of
         nil ->
             ?LOG_DEBUG("OAuth handler: user ~p credentials not found", [Name]),
@@ -55,7 +59,11 @@ set_user_ctx(Req, Name) ->
         User ->
             Roles = couch_util:get_value(<<"roles">>, User, []),
             Req#httpd{user_ctx=#user_ctx{name=?l2b(Name), roles=Roles}}
-    end.
+    end;
+set_user_ctx(Req, Name, DelegationRoles) ->
+    ?LOG_DEBUG("Setting delegated oauth user_ctx, username: ~p, roles: ~p",
+        [Name, DelegationRoles]),
+    Req#httpd{user_ctx = #user_ctx{name = ?l2b(Name), roles = DelegationRoles}}.
 
 % OAuth request_token
 handle_oauth_req(#httpd{path_parts=[_OAuth, <<"request_token">>], method=Method}=Req) ->
@@ -210,8 +218,8 @@ access_token_info(Token) ->
         case query_map_view(Db, ?DDOC_ID, <<"access_token_info">>, Token) of
         undefined ->
             [undefined, undefined];
-        TokenInfo ->
-            lists:map(fun binary_to_list/1, TokenInfo)
+        [TokenSecret, Username | DelegatedRoles] ->
+            [?b2l(TokenSecret), ?b2l(Username) | DelegatedRoles]
         end,
         couch_db:close(Db),
         Info;
@@ -276,12 +284,20 @@ consumer_key_secret_map_fun() ->
                 for (var consumer_key in doc.oauth.consumer_keys) {
                     emit(consumer_key, doc.oauth.consumer_keys[consumer_key]);
                 }
+                var dels = doc.delegations || [];
+                for (var i = 0; i < dels.length; i++) {
+                    emit(dels[i].oauth.consumer_key,
+                        dels[i].oauth.consumer_secret);
+                }
             }
         }
     ">>.
 
 access_token_info_map_fun() ->
-    % map results =>  key: access_token, value: [access_token_secret, username]
+    % map results =>
+    %     key: access_token,
+    %     value: [access_token_secret, username] ||
+    %            [access_token_secret, delegation_username, delegation_roles]
     % (username == resource owner in OAuth's jargon)
     % (For 2-legged OAuth the consumer is the same as the resource owner)
     <<"
@@ -289,6 +305,14 @@ access_token_info_map_fun() ->
             if (doc.type === 'user' && doc.oauth && doc.oauth.tokens) {
                 for (var token in doc.oauth.tokens) {
                     emit(token, [doc.oauth.tokens[token], doc.name]);
+                }
+                var dels = doc.delegations || [];
+                var del_name, del_roles;
+                for (var i = 0; i < dels.length; i++) {
+                    del_name = dels[i].name + '.delegated.' + dels[i].database;
+                    del_roles = dels[i].roles || [];
+                    emit(dels[i].oauth.token,
+                        [dels[i].oauth.token_secret, del_name, del_roles]);
                 }
             }
         }
