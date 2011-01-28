@@ -14,7 +14,7 @@
 -behaviour(gen_server).
 
 % public API
--export([get_user_creds/1]).
+-export([get_user_creds/1, add_oauth_creds/2]).
 
 % gen_server API
 -export([start_link/0, init/1, handle_call/3, handle_info/2, handle_cast/2]).
@@ -27,15 +27,33 @@
 -define(BY_USER, auth_by_user_ets).
 -define(BY_ATIME, auth_by_atime_ets).
 
+% maps oauth pair ({consumer_key, token}) to oauth credentials and last
+% access time
+-define(OAUTH_TO_CREDS, oauth_pair_to_user_creds_ets).
+% maps a username into a list of oauth pairs (that are defined by his user doc)
+-define(USER_TO_OAUTH_PAIRS, user_doc_id_to_oauth_pairs_ets).
+% maps access times to oauth pairs and respective users
+-define(BY_ATIME_OAUTH, oauth_pair_to_atime_ets).
+
 -record(state, {
     max_cache_size = 0,
     cache_size = 0,
+    max_oauth_pairs = 0,
+    num_oauth_pairs = 0,
     db_notifier = nil
 }).
 
 
--spec get_user_creds(UserName::string() | binary()) ->
-    Credentials::list() | nil.
+-type oauth_pair() :: {ConsumerKey :: string(), Token :: string()}.
+-type roles() :: [binary()].
+-spec get_user_creds(UserName::string() | binary() | oauth_pair()) ->
+    Credentials::list() |
+    {UserName::binary(), UserRoles::roles(),
+        ConsumerSecret::string(), TokenSecret::string()} |
+    nil.
+
+get_user_creds({_ConsumerKey, _Token} = OAuthPair) ->
+    get_from_cache(OAuthPair);
 
 get_user_creds(UserName) when is_list(UserName) ->
     get_user_creds(?l2b(UserName));
@@ -63,6 +81,23 @@ get_user_creds(UserName) ->
     validate_user_creds(UserCreds).
 
 
+get_from_cache({_ConsumerKey, _Token} = OAuthPair) ->
+    exec_if_auth_db(
+        fun(_AuthDb) ->
+            maybe_refresh_cache(),
+            case ets:lookup(?OAUTH_TO_CREDS, OAuthPair) of
+            [] ->
+                couch_stats_collector:increment({couchdb, auth_cache_misses}),
+                nil;
+            [{OAuthPair, {Credentials, _ATime}}] ->
+                couch_stats_collector:increment({couchdb, auth_cache_hits}),
+                gen_server:cast(?MODULE, {cache_hit, OAuthPair}),
+                Credentials
+            end
+        end,
+        nil
+    );
+
 get_from_cache(UserName) ->
     exec_if_auth_db(
         fun(_AuthDb) ->
@@ -78,6 +113,10 @@ get_from_cache(UserName) ->
         end,
         nil
     ).
+
+
+add_oauth_creds(OAuthPair, Credentials) ->
+    ok = gen_server:cast(?MODULE, {add_oauth_creds, OAuthPair, Credentials}).
 
 
 validate_user_creds(nil) ->
@@ -103,6 +142,11 @@ init(_) ->
     ?STATE = ets:new(?STATE, [set, protected, named_table]),
     ?BY_USER = ets:new(?BY_USER, [set, protected, named_table]),
     ?BY_ATIME = ets:new(?BY_ATIME, [ordered_set, private, named_table]),
+    ?OAUTH_TO_CREDS = ets:new(?OAUTH_TO_CREDS, [set, protected, named_table]),
+    ?USER_TO_OAUTH_PAIRS = ets:new(
+        ?USER_TO_OAUTH_PAIRS, [bag, private, named_table]),
+    ?BY_ATIME_OAUTH = ets:new(
+        ?BY_ATIME_OAUTH, [ordered_set, private, named_table]),
     AuthDbName = couch_config:get("couch_httpd_auth", "authentication_db"),
     true = ets:insert(?STATE, {auth_db_name, ?l2b(AuthDbName)}),
     true = ets:insert(?STATE, {auth_db, open_auth_db()}),
@@ -110,11 +154,11 @@ init(_) ->
     ok = couch_config:register(
         fun("couch_httpd_auth", "auth_cache_size", SizeList) ->
             Size = list_to_integer(SizeList),
-            ok = gen_server:call(?MODULE, {new_max_cache_size, Size}, infinity)
-        end
-    ),
-    ok = couch_config:register(
-        fun("couch_httpd_auth", "authentication_db", DbName) ->
+            ok = gen_server:call(?MODULE, {new_max_cache_size, Size}, infinity);
+        ("couch_httpd_auth", "oauth_cache_size", SizeList) ->
+            Sz = list_to_integer(SizeList),
+            ok = gen_server:call(?MODULE, {new_max_oauth_pairs, Sz}, infinity);
+        ("couch_httpd_auth", "authentication_db", DbName) ->
             ok = gen_server:call(?MODULE, {new_auth_db, ?l2b(DbName)}, infinity)
         end
     ),
@@ -123,6 +167,9 @@ init(_) ->
         db_notifier = Notifier,
         max_cache_size = list_to_integer(
             couch_config:get("couch_httpd_auth", "auth_cache_size", "50")
+        ),
+        max_oauth_pairs = list_to_integer(
+            couch_config:get("couch_httpd_auth", "max_oauth_pairs", "1000")
         )
     },
     {ok, State}.
@@ -158,24 +205,23 @@ handle_call(auth_db_created, _From, State) ->
     true = ets:insert(?STATE, {auth_db, open_auth_db()}),
     {reply, ok, NewState};
 
+handle_call({new_max_cache_size, NewSize},
+        _From, #state{cache_size = Size} = State) when NewSize >= Size ->
+    {reply, ok, State#state{max_cache_size = NewSize}};
+
 handle_call({new_max_cache_size, NewSize}, _From, State) ->
-    case NewSize >= State#state.cache_size of
-    true ->
-        ok;
-    false ->
-        lists:foreach(
-            fun(_) ->
-                LruTime = ets:last(?BY_ATIME),
-                [{LruTime, UserName}] = ets:lookup(?BY_ATIME, LruTime),
-                true = ets:delete(?BY_ATIME, LruTime),
-                true = ets:delete(?BY_USER, UserName)
-            end,
-            lists:seq(1, State#state.cache_size - NewSize)
-        )
-    end,
+    free_mru_cache_entries(State#state.cache_size - NewSize),
+    {reply, ok, State#state{max_cache_size = NewSize, cache_size = NewSize}};
+
+handle_call({new_max_oauth_pairs, NewSize}, _From,
+        #state{num_oauth_pairs = Size} = State) when NewSize >= Size ->
+    {reply, ok, State#state{max_oauth_pairs = NewSize}};
+
+handle_call({new_max_oauth_pairs, NewSize}, _From, State) ->
+    free_oauth_mru_cache_entries(State#state.num_oauth_pairs - NewSize),
     NewState = State#state{
-        max_cache_size = NewSize,
-        cache_size = erlang:min(NewSize, State#state.cache_size)
+        max_oauth_pairs = NewSize,
+        num_oauth_pairs = NewSize
     },
     {reply, ok, NewState};
 
@@ -198,6 +244,27 @@ handle_call(refresh, _From, State) ->
     {reply, ok, State}.
 
 
+handle_cast({add_oauth_creds, _, _}, #state{max_oauth_pairs = 0} = State) ->
+    {noreply, State};
+
+handle_cast({add_oauth_creds, OAuthPair, Creds}, State) ->
+    case ets:lookup(?OAUTH_TO_CREDS, OAuthPair) of
+    [{OAuthPair, {Creds, _ATime}}] ->
+        {noreply, State};
+    [] ->
+        NewState = add_oauth_cache_entry(OAuthPair, Creds, erlang:now(), State),
+        {noreply, NewState}
+    end;
+
+handle_cast({cache_hit, {_ConsumerKey, _Token} = OAuthPair}, State) ->
+    case ets:lookup(?OAUTH_TO_CREDS, OAuthPair) of
+    [{OAuthPair, {Credentials, ATime}}] ->
+        cache_hit(OAuthPair, Credentials, ATime);
+    _ ->
+        ok
+    end,
+    {noreply, State};
+
 handle_cast({cache_hit, UserName}, State) ->
     case ets:lookup(?BY_USER, UserName) of
     [{UserName, {Credentials, ATime}}] ->
@@ -217,7 +284,9 @@ terminate(_Reason, #state{db_notifier = Notifier}) ->
     exec_if_auth_db(fun(AuthDb) -> catch couch_db:close(AuthDb) end),
     true = ets:delete(?BY_USER),
     true = ets:delete(?BY_ATIME),
-    true = ets:delete(?STATE).
+    true = ets:delete(?STATE),
+    true = ets:delete(?OAUTH_TO_CREDS),
+    true = ets:delete(?USER_TO_OAUTH_PAIRS).
 
 
 code_change(_OldVsn, State, _Extra) ->
@@ -228,9 +297,12 @@ clear_cache(State) ->
     exec_if_auth_db(fun(AuthDb) -> catch couch_db:close(AuthDb) end),
     true = ets:delete_all_objects(?BY_USER),
     true = ets:delete_all_objects(?BY_ATIME),
-    State#state{cache_size = 0}.
+    true = ets:delete_all_objects(?OAUTH_TO_CREDS),
+    true = ets:delete_all_objects(?USER_TO_OAUTH_PAIRS),
+    State#state{cache_size = 0, num_oauth_pairs = 0}.
 
-
+add_cache_entry(_, _, _, #state{max_cache_size = 0} = State) ->
+    State;
 add_cache_entry(UserName, Credentials, ATime, State) ->
     case State#state.cache_size >= State#state.max_cache_size of
     true ->
@@ -242,17 +314,53 @@ add_cache_entry(UserName, Credentials, ATime, State) ->
     true = ets:insert(?BY_USER, {UserName, {Credentials, ATime}}),
     State#state{cache_size = couch_util:get_value(size, ets:info(?BY_USER))}.
 
+free_mru_cache_entries(0) ->
+    ok;
+free_mru_cache_entries(N) when N > 0 ->
+    free_mru_cache_entry(),
+    free_mru_cache_entries(N - 1).
 
 free_mru_cache_entry() ->
-    case ets:last(?BY_ATIME) of
-    '$end_of_table' ->
-        ok;  % empty cache
-    LruTime ->
-        [{LruTime, UserName}] = ets:lookup(?BY_ATIME, LruTime),
-        true = ets:delete(?BY_ATIME, LruTime),
-        true = ets:delete(?BY_USER, UserName)
-    end.
+    MruTime = ets:last(?BY_ATIME),
+    [{MruTime, UserName}] = ets:lookup(?BY_ATIME, MruTime),
+    true = ets:delete(?BY_ATIME, MruTime),
+    true = ets:delete(?BY_USER, UserName).
 
+add_oauth_cache_entry(OAuthPair, {User, _, _, _} = Credentials, ATime, State) ->
+    case State#state.num_oauth_pairs >= State#state.max_oauth_pairs of
+    true ->
+        free_oauth_mru_cache_entry();
+    false ->
+        ok
+    end,
+    true = ets:insert(?BY_ATIME_OAUTH, {ATime, OAuthPair}),
+    true = ets:insert(?OAUTH_TO_CREDS, {OAuthPair, {Credentials, ATime}}),
+    true = ets:insert(?USER_TO_OAUTH_PAIRS, {User, OAuthPair}),
+    State#state{
+        num_oauth_pairs = couch_util:get_value(size, ets:info(?OAUTH_TO_CREDS))
+    }.
+
+free_oauth_mru_cache_entries(0) ->
+    ok;
+free_oauth_mru_cache_entries(N) when N > 0 ->
+    free_oauth_mru_cache_entry(),
+    free_oauth_mru_cache_entries(N - 1).
+
+free_oauth_mru_cache_entry() ->
+    MruTime = ets:last(?BY_ATIME_OAUTH),
+    [{MruTime, OAuthPair}] = ets:lookup(?BY_ATIME_OAUTH, MruTime),
+    true = ets:delete(?BY_ATIME_OAUTH, MruTime),
+    [{OAuthPair, {{User, _, _, _}, MruTime}}] = ets:lookup(
+        ?OAUTH_TO_CREDS, OAuthPair),
+    true = ets:delete(?OAUTH_TO_CREDS, OAuthPair),
+    true = ets:delete_object(?USER_TO_OAUTH_PAIRS, {User, OAuthPair}).
+
+
+cache_hit({_ConsumerKey, _Token} = OAuthPair, Credentials, ATime) ->
+    NewATime = erlang:now(),
+    true = ets:delete(?BY_ATIME_OAUTH, ATime),
+    true = ets:insert(?BY_ATIME_OAUTH, {NewATime, OAuthPair}),
+    true = ets:insert(?OAUTH_TO_CREDS, {OAuthPair, {Credentials, NewATime}});
 
 cache_hit(UserName, Credentials, ATime) ->
     NewATime = erlang:now(),
@@ -292,6 +400,24 @@ refresh_entry(Db, #doc_info{high_seq = DocSeq} = DocInfo) ->
             {ok, Doc} = couch_db:open_doc(Db, DocInfo, [conflicts, deleted]),
             NewCreds = user_creds(Doc),
             true = ets:insert(?BY_USER, {UserName, {NewCreds, ATime}})
+        end,
+        % Purge oauth pairs, from the cache, associated with the previous
+        % revisions of this doc. For simplicity and efficiency, we don't
+        % if the new user doc revision has new oauth credentials, updated
+        % oauth secrets or removed oauth credentials.
+        case ets:lookup(?USER_TO_OAUTH_PAIRS, UserName) of
+        [] ->
+            ok;
+        PairList ->
+            lists:foreach(
+                fun({Name, Pair}) when Name =:= UserName ->
+                    [{Pair, {{Name, _, _, _}, T}}] = ets:lookup(
+                        ?OAUTH_TO_CREDS, Pair),
+                    true = ets:delete(?BY_ATIME_OAUTH, T),
+                    true = ets:delete(?OAUTH_TO_CREDS, Pair)
+                end,
+                PairList),
+            true = ets:delete(?USER_TO_OAUTH_PAIRS, UserName)
         end;
     false ->
         ok

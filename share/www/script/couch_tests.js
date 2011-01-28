@@ -65,6 +65,7 @@ loadTest("multiple_rows.js");
 loadScript("script/oauth.js");
 loadScript("script/sha1.js");
 loadTest("oauth.js");
+loadTest("oauth_cache.js");
 loadTest("oauth_users_db.js");
 loadTest("oauth_delegation.js");
 loadTest("proxyauth.js");

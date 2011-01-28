@@ -148,6 +148,7 @@ nobase_dist_localdata_DATA = \
     www/script/test/method_override.js \
     www/script/test/multiple_rows.js \
     www/script/test/oauth.js \
+    www/script/test/oauth_cache.js \
     www/script/test/oauth_users_db.js \
     www/script/test/oauth_delegation.js \
     www/script/test/proxyauth.js \
