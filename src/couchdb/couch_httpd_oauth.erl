@@ -263,6 +263,10 @@ get_oauth_callback_params(ConsumerKey, Params, Url) ->
                     username = User,
                     roles = Roles
                 },
+                ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~s and Token ~s, "
+                    "from the views, User: ~s, Roles: ~p, ConsumerSecret: ~s, "
+                    "TokenSecret: ~s",
+                    [ConsumerKey, Token, User, Roles, ConsumerSecret, TokenSecret]),
                 ok = couch_auth_cache:add_oauth_creds(
                     {ConsumerKey, Token},
                     {User, Roles, ConsumerSecret, TokenSecret}),
@@ -272,7 +276,8 @@ get_oauth_callback_params(ConsumerKey, Params, Url) ->
     {UserName, Roles, ConsumerSecret, TokenSecret} ->
         ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~s and Token ~s, "
             "from cache, User: ~s, Roles: ~p, ConsumerSecret: ~s, "
-            "TokenSecret: ~s", [UserName, Roles, ConsumerSecret, TokenSecret]),
+            "TokenSecret: ~s",
+            [ConsumerKey, Token, UserName, Roles, ConsumerSecret, TokenSecret]),
         CbParams = CbParams0#oauth_callback_params{
             consumer = {ConsumerKey, ConsumerSecret, SigMethod},
             token_secret = TokenSecret,
