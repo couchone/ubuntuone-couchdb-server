@@ -78,7 +78,7 @@ set_user_ctx(Req, Name, DelegationRoles) ->
 handle_oauth_req(#httpd{path_parts=[_OAuth, <<"request_token">>], method=Method}=Req) ->
     serve_oauth(Req, fun(URL, Params, Consumer, Signature) ->
         AccessToken = couch_util:get_value("oauth_token", Params),
-        [TokenSecret, _Username] = access_token_info(AccessToken),
+        [TokenSecret, _Username | _Roles] = access_token_info(AccessToken),
         case oauth:verify(Signature, atom_to_list(Method), URL, Params, Consumer, TokenSecret) of
             true ->
                 ok(Req, <<"oauth_token=requestkey&oauth_token_secret=requestsecret">>);
@@ -115,7 +115,7 @@ serve_oauth_authorize(#httpd{method=Method}=Req) ->
             % Confirm with the User that they want to authenticate the Consumer
             serve_oauth(Req, fun(URL, Params, Consumer, Signature) ->
                 AccessToken = couch_util:get_value("oauth_token", Params),
-                [TokenSecret, _Username] = access_token_info(AccessToken),
+                [TokenSecret, _Username | _Roles] = access_token_info(AccessToken),
                 case oauth:verify(Signature, "GET", URL, Params, Consumer, TokenSecret) of
                     true ->
                         ok(Req, <<"oauth_token=requestkey&oauth_token_secret=requestsecret">>);
@@ -127,7 +127,7 @@ serve_oauth_authorize(#httpd{method=Method}=Req) ->
             % If the User has confirmed, we direct the User back to the Consumer with a verification code
             serve_oauth(Req, fun(URL, Params, Consumer, Signature) ->
                 AccessToken = couch_util:get_value("oauth_token", Params),
-                [TokenSecret, _Username] = access_token_info(AccessToken),
+                [TokenSecret, _Username | _Roles] = access_token_info(AccessToken),
                 case oauth:verify(Signature, "POST", URL, Params, Consumer, TokenSecret) of
                     true ->
                         %redirect(oauth_callback, oauth_token, oauth_verifier),
