@@ -15,45 +15,50 @@
 
 -export([oauth_authentication_handler/1, handle_oauth_req/1, consumer_lookup/2]).
 
+-record(oauth_callback_params, {
+    consumer,
+    token,
+    token_secret,
+    url,
+    signature,
+    params,
+    username,
+    roles
+}).
+
 % OAuth auth handler using per-node user db
 oauth_authentication_handler(Req) ->
-    serve_oauth(Req, fun(URL, Params, Consumer, Signature) ->
-        AccessToken = couch_util:get_value("oauth_token", Params),
-        case access_token_info(AccessToken) of
-        {error, {Error, Reason}} ->
-            couch_httpd:send_error(Req, 400, Error, Reason);
-        [undefined, _ | _] ->
-            couch_httpd:send_error(
-                Req, 400, <<"invalid_token">>, <<"Invalid OAuth token.">>);
-        [Ts, User] ->
-            validate_token_secret(
-                Req, [Ts, User, undefined], URL, Params, Consumer, Signature);
-        [_, _, _] = Delegation ->
-            validate_token_secret(
-                Req, Delegation, URL, Params, Consumer, Signature)
-        end
-    end, true).
+    serve_oauth(Req, fun oauth_auth_callback/2, true).
 
-validate_token_secret(
-        #httpd{mochi_req = MochiReq} = Req,
-        [TokenSecret, Username, DelegationRoles],
-        URL, Params, Consumer, Signature) ->
-    case oauth:verify(Signature, atom_to_list(MochiReq:get(method)),
-        URL, Params, Consumer, TokenSecret) of
+oauth_auth_callback(Req, #oauth_callback_params{token_secret = undefined}) ->
+    couch_httpd:send_error(
+         Req, 400,
+         <<"invalid_token">>, <<"Invalid OAuth token.">>);
+oauth_auth_callback(#httpd{mochi_req = MochiReq} = Req, CbParams) ->
+    Method = atom_to_list(MochiReq:get(method)),
+    #oauth_callback_params{
+        consumer = Consumer,
+        token_secret = TokenSecret,
+        url = Url,
+        signature = Sig,
+        params = Params,
+        username = User,
+        roles = Roles
+    } = CbParams,
+    case oauth:verify(Sig, Method, Url, Params, Consumer, TokenSecret) of
     true ->
-        set_user_ctx(Req, Username, DelegationRoles);
+        set_user_ctx(Req, User, Roles);
     false ->
         ?LOG_DEBUG("OAuth handler: signature verification failed for user ~p",
-            [Username]),
-        ?LOG_DEBUG("OAuth handler: received signature ~p", [Signature]),
-        ?LOG_DEBUG("OAuth handler: HTTP method ~p", [MochiReq:get(method)]),
-        ?LOG_DEBUG("OAuth handler: URL ~p", [URL]),
+            [User]),
+        ?LOG_DEBUG("OAuth handler: received signature ~p", [Sig]),
+        ?LOG_DEBUG("OAuth handler: HTTP method ~s", [Method]),
+        ?LOG_DEBUG("OAuth handler: URL ~p", [Url]),
         ?LOG_DEBUG("OAuth handler: Parameters ~p", [Params]),
         ?LOG_DEBUG("OAuth handler: Consumer ~p, TokenSecret ~p",
             [Consumer, TokenSecret]),
         ?LOG_DEBUG("OAuth handler: expected signature ~p",
-            [oauth:signature(atom_to_list(MochiReq:get(method)),
-                URL, Params, Consumer, TokenSecret)]),
+            [oauth:signature(Method), Url, Params, Consumer, TokenSecret]),
         Req
     end.
 
@@ -67,39 +72,55 @@ set_user_ctx(Req, Name, undefined) ->
             Req;
         User ->
             Roles = couch_util:get_value(<<"roles">>, User, []),
-            Req#httpd{user_ctx=#user_ctx{name=?l2b(Name), roles=Roles}}
+            Req#httpd{user_ctx=#user_ctx{name=Name, roles=Roles}}
     end;
 set_user_ctx(Req, Name, DelegationRoles) ->
     ?LOG_DEBUG("Setting delegated oauth user_ctx, username: ~p, roles: ~p",
         [Name, DelegationRoles]),
-    Req#httpd{user_ctx = #user_ctx{name = ?l2b(Name), roles = DelegationRoles}}.
+    Req#httpd{user_ctx = #user_ctx{name = Name, roles = DelegationRoles}}.
 
 % OAuth request_token
-handle_oauth_req(#httpd{path_parts=[_OAuth, <<"request_token">>], method=Method}=Req) ->
-    serve_oauth(Req, fun(URL, Params, Consumer, Signature) ->
-        AccessToken = couch_util:get_value("oauth_token", Params),
-        [TokenSecret, _Username | _Roles] = access_token_info(AccessToken),
-        case oauth:verify(Signature, atom_to_list(Method), URL, Params, Consumer, TokenSecret) of
-            true ->
-                ok(Req, <<"oauth_token=requestkey&oauth_token_secret=requestsecret">>);
-            false ->
-                invalid_signature(Req)
+handle_oauth_req(#httpd{path_parts=[_OAuth, <<"request_token">>], method=Method}=Req1) ->
+    serve_oauth(Req1, fun(Req, CbParams) ->
+        #oauth_callback_params{
+            consumer = Consumer,
+            token_secret = TokenSecret,
+            url = Url,
+            signature = Sig,
+            params = Params
+        } = CbParams,
+        case oauth:verify(
+            Sig, atom_to_list(Method), Url, Params, Consumer, TokenSecret) of
+        true ->
+            ok(Req, <<"oauth_token=requestkey&oauth_token_secret=requestsecret">>);
+        false ->
+            invalid_signature(Req)
         end
     end, false);
 handle_oauth_req(#httpd{path_parts=[_OAuth, <<"authorize">>]}=Req) ->
     {ok, serve_oauth_authorize(Req)};
-handle_oauth_req(#httpd{path_parts=[_OAuth, <<"access_token">>], method='GET'}=Req) ->
-    serve_oauth(Req, fun(URL, Params, Consumer, Signature) ->
-        case oauth:token(Params) of
-            "requestkey" ->
-                case oauth:verify(Signature, "GET", URL, Params, Consumer, "requestsecret") of
-                    true ->
-                        ok(Req, <<"oauth_token=accesskey&oauth_token_secret=accesssecret">>);
-                    false ->
-                        invalid_signature(Req)
-                end;
-            _ ->
-                couch_httpd:send_error(Req, 400, <<"invalid_token">>, <<"Invalid OAuth token.">>)
+handle_oauth_req(#httpd{path_parts=[_OAuth, <<"access_token">>], method='GET'}=Req1) ->
+    serve_oauth(Req1, fun(Req, CbParams) ->
+        #oauth_callback_params{
+            consumer = Consumer,
+            token = Token,
+            url = Url,
+            signature = Sig,
+            params = Params
+        } = CbParams,
+        case Token of
+        "requestkey" ->
+            case oauth:verify(
+                Sig, "GET", Url, Params, Consumer, "requestsecret") of
+            true ->
+                ok(Req,
+                    <<"oauth_token=accesskey&oauth_token_secret=accesssecret">>);
+            false ->
+                invalid_signature(Req)
+            end;
+        _ ->
+            couch_httpd:send_error(
+                Req, 400, <<"invalid_token">>, <<"Invalid OAuth token.">>)
         end
     end, false);
 handle_oauth_req(#httpd{path_parts=[_OAuth, <<"access_token">>]}=Req) ->
@@ -109,35 +130,49 @@ invalid_signature(Req) ->
     couch_httpd:send_error(Req, 400, <<"invalid_signature">>, <<"Invalid signature value.">>).
 
 % This needs to be protected i.e. force user to login using HTTP Basic Auth or form-based login.
-serve_oauth_authorize(#httpd{method=Method}=Req) ->
+serve_oauth_authorize(#httpd{method=Method}=Req1) ->
     case Method of
         'GET' ->
             % Confirm with the User that they want to authenticate the Consumer
-            serve_oauth(Req, fun(URL, Params, Consumer, Signature) ->
-                AccessToken = couch_util:get_value("oauth_token", Params),
-                [TokenSecret, _Username | _Roles] = access_token_info(AccessToken),
-                case oauth:verify(Signature, "GET", URL, Params, Consumer, TokenSecret) of
-                    true ->
-                        ok(Req, <<"oauth_token=requestkey&oauth_token_secret=requestsecret">>);
-                    false ->
-                        invalid_signature(Req)
+            serve_oauth(Req1, fun(Req, CbParams) ->
+                #oauth_callback_params{
+                    consumer = Consumer,
+                    token_secret = TokenSecret,
+                    url = Url,
+                    signature = Sig,
+                    params = Params
+                } = CbParams,
+                case oauth:verify(
+                    Sig, "GET", Url, Params, Consumer, TokenSecret) of
+                true ->
+                    ok(Req, <<"oauth_token=requestkey&",
+                        "oauth_token_secret=requestsecret">>);
+                false ->
+                    invalid_signature(Req)
                 end
             end, false);
         'POST' ->
             % If the User has confirmed, we direct the User back to the Consumer with a verification code
-            serve_oauth(Req, fun(URL, Params, Consumer, Signature) ->
-                AccessToken = couch_util:get_value("oauth_token", Params),
-                [TokenSecret, _Username | _Roles] = access_token_info(AccessToken),
-                case oauth:verify(Signature, "POST", URL, Params, Consumer, TokenSecret) of
-                    true ->
-                        %redirect(oauth_callback, oauth_token, oauth_verifier),
-                        ok(Req, <<"oauth_token=requestkey&oauth_token_secret=requestsecret">>);
-                    false ->
-                        invalid_signature(Req)
+            serve_oauth(Req1, fun(Req, CbParams) ->
+                #oauth_callback_params{
+                    consumer = Consumer,
+                    token_secret = TokenSecret,
+                    url = Url,
+                    signature = Sig,
+                    params = Params
+                } = CbParams,
+                case oauth:verify(
+                    Sig, "POST", Url, Params, Consumer, TokenSecret) of
+                true ->
+                    %redirect(oauth_callback, oauth_token, oauth_verifier),
+                    ok(Req, <<"oauth_token=requestkey&",
+                        "oauth_token_secret=requestsecret">>);
+                false ->
+                    invalid_signature(Req)
                 end
             end, false);
         _ ->
-            couch_httpd:send_method_not_allowed(Req, "GET,POST")
+            couch_httpd:send_method_not_allowed(Req1, "GET,POST")
     end.
 
 serve_oauth(#httpd{mochi_req=MochiReq}=Req, Fun, FailSilently) ->
@@ -167,39 +202,110 @@ serve_oauth(#httpd{mochi_req=MochiReq}=Req, Fun, FailSilently) ->
                         false -> couch_httpd:send_error(Req, 400, <<"invalid_consumer">>, <<"Invalid consumer.">>)
                     end;
                 ConsumerKey ->
-                    SigMethod = couch_util:get_value("oauth_signature_method", Params),
-                    case consumer_lookup(ConsumerKey, SigMethod) of
-                        none ->
-                            couch_httpd:send_error(Req, 400, <<"invalid_consumer">>, <<"Invalid consumer (key or signature method).">>);
+                    Url = couch_httpd:absolute_uri(Req, MochiReq:get(raw_path)),
+                    case get_oauth_callback_params(ConsumerKey, Params, Url) of
+                        {ok, CallbackParams} ->
+                            Fun(Req, CallbackParams);
+                        invalid_consumer ->
+                            couch_httpd:send_error(
+                                Req, 400,
+                                <<"invalid_consumer">>,
+                                <<"Invalid consumer (key or signature method).">>);
                         {error, {Error, Reason}} ->
-                            couch_httpd:send_error(Req, 400, Error, Reason);
-                        Consumer ->
-                            Signature = couch_util:get_value("oauth_signature", Params),
-                            URL = couch_httpd:absolute_uri(Req, MochiReq:get(raw_path)),
-                            Fun(URL, proplists:delete("oauth_signature", Params),
-                                Consumer, Signature)
+                            couch_httpd:send_error(Req, 400, Error, Reason)
                     end
             end;
         _ ->
             couch_httpd:send_error(Req, 400, <<"invalid_oauth_version">>, <<"Invalid OAuth version.">>)
     end.
 
-consumer_lookup(Key, MethodStr) ->
-    SignatureMethod = case MethodStr of
-        "PLAINTEXT" -> plaintext;
-        "HMAC-SHA1" -> hmac_sha1;
-        %"RSA-SHA1" -> rsa_sha1;
-        _Else -> undefined
-    end,
-    case SignatureMethod of
-        undefined -> none;
-        _SupportedMethod ->
-            case consumer_key_secret(Key) of
-                undefined -> none;
-                {error, _} = Err -> Err;
-                Secret -> {Key, Secret, SignatureMethod}
+get_oauth_callback_params(ConsumerKey, Params, Url) ->
+    Token = couch_util:get_value("oauth_token", Params),
+    SigMethod = sig_method(Params),
+    CbParams0 = #oauth_callback_params{
+        token = Token,
+        signature = couch_util:get_value("oauth_signature", Params),
+        params = proplists:delete("oauth_signature", Params),
+        url = Url
+    },
+    case couch_auth_cache:get_user_creds({ConsumerKey, Token}) of
+    nil ->
+        case consumer_key_secret(ConsumerKey) of
+        undefined ->
+            invalid_consumer;
+        {error, _} = Err ->
+            Err;
+        ConsumerSecret ->
+            case access_token_info(Token) of
+            {error, _} = Err ->
+                Err;
+            [undefined, undefined | _] ->
+                CbParams = CbParams0#oauth_callback_params{
+                    consumer = {ConsumerKey, ConsumerSecret, SigMethod}
+                },
+                {ok, CbParams};
+            [TokenSecret, User1 | Rest] ->
+                User = ?l2b(User1),
+                Roles = case Rest of
+                [] ->
+                    case couch_auth_cache:get_user_creds(User) of
+                    nil ->
+                        undefined;
+                    UserCreds ->
+                        couch_util:get_value(<<"roles">>, UserCreds, [])
+                    end;
+                [DelegatedRoles] ->
+                    DelegatedRoles
+                end,
+                CbParams = CbParams0#oauth_callback_params{
+                    consumer = {ConsumerKey, ConsumerSecret, SigMethod},
+                    token_secret = TokenSecret,
+                    username = User,
+                    roles = Roles
+                },
+                ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~s and Token ~s, "
+                    "from the views, User: ~s, Roles: ~p, ConsumerSecret: ~s, "
+                    "TokenSecret: ~s",
+                    [ConsumerKey, Token, User, Roles, ConsumerSecret, TokenSecret]),
+                ok = couch_auth_cache:add_oauth_creds(
+                    {ConsumerKey, Token},
+                    {User, Roles, ConsumerSecret, TokenSecret}),
+                {ok, CbParams}
             end
+        end;
+    {UserName, Roles, ConsumerSecret, TokenSecret} ->
+        ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~s and Token ~s, "
+            "from cache, User: ~s, Roles: ~p, ConsumerSecret: ~s, "
+            "TokenSecret: ~s",
+            [ConsumerKey, Token, UserName, Roles, ConsumerSecret, TokenSecret]),
+        CbParams = CbParams0#oauth_callback_params{
+            consumer = {ConsumerKey, ConsumerSecret, SigMethod},
+            token_secret = TokenSecret,
+            username = UserName,
+            roles = Roles
+        },
+        {ok, CbParams}
     end.
+
+consumer_lookup(_Key, undefined) ->
+    none;
+consumer_lookup(Key, SignatureMethod) ->
+    case consumer_key_secret(Key) of
+        undefined -> none;
+        {error, _} = Err -> Err;
+        Secret -> {Key, Secret, SignatureMethod}
+    end.
+
+sig_method(Params) ->
+    sig_method_1(couch_util:get_value("oauth_signature_method", Params)).
+sig_method_1("PLAINTEXT") ->
+    plaintext;
+% sig_method_1("RSA-SHA1") ->
+%    rsa_sha1;
+sig_method_1("HMAC-SHA1") ->
+    hmac_sha1;
+sig_method_1(_) ->
+    undefined.
 
 ok(#httpd{mochi_req=MochiReq}, Body) ->
     {ok, MochiReq:respond({200, [], Body})}.
