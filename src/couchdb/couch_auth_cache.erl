@@ -169,7 +169,7 @@ init(_) ->
             couch_config:get("couch_httpd_auth", "auth_cache_size", "50")
         ),
         max_oauth_pairs = list_to_integer(
-            couch_config:get("couch_httpd_auth", "max_oauth_pairs", "1000")
+            couch_config:get("couch_httpd_auth", "oauth_cache_size", "1000")
         )
     },
     {ok, State}.

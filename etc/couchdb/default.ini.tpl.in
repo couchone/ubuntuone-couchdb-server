@@ -34,7 +34,7 @@ authentication_redirect = /_utils/session.html
 require_valid_user = false
 timeout = 600 ; number of seconds before automatic logout
 auth_cache_size = 50 ; size is number of cache entries
-oauth_cache_size = 1000; size is number of cached OAuth pairs (token/consumer key)
+oauth_cache_size = 1000 ; size is number of cached OAuth pairs (token/consumer key)
 
 [query_servers]
 javascript = %bindir%/%couchjs_command_name% %localbuilddatadir%/server/main.js
