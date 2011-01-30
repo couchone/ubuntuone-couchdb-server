@@ -36,6 +36,16 @@ couchTests.oauth_cache = function(debug) {
       section: "couch_httpd_oauth",
       key: "use_user_db",
       value: "true"
+    },
+    {
+      section: "couch_httpd_auth",
+      key: "oauth_cache_size",
+      value: "3"
+    },
+    {
+      section: "couch_httpd_auth",
+      key: "auth_cache_size",
+      value: "3"
     }
   ];
 
@@ -132,7 +142,8 @@ couchTests.oauth_cache = function(debug) {
 
   function cacheTestFun() {
     var fdmanana_oauth_msg, fdmanana_oauth_accessor;
-    var joe_oauth_msg, joe_oauth_accessor;
+    var joe_oauth_msg, joe_oauth_accessor, joe_oauth_msg2, joe_oauth_accessor2;
+    var del_oauth_msg, del_oauth_accessor;
     var xhr, data, user_doc, doc;
     var hits_before, misses_before, hits_after, misses_after;
 
@@ -154,6 +165,19 @@ couchTests.oauth_cache = function(debug) {
       tokenSecret: "123"
     };
 
+    del_oauth_msg = {
+      parameters: {
+        oauth_signature_method: "HMAC-SHA1",
+        oauth_consumer_key: "fil_consumer_key",
+        oauth_token: "fil_token",
+        oauth_version: "1.0"
+      }
+    };
+    del_oauth_accessor = {
+      consumerSecret: "fil_consumer_secret",
+      tokenSecret: "fil_token_secret"
+    };
+
     joe_oauth_msg = {
       parameters: {
         oauth_signature_method: "HMAC-SHA1",
@@ -165,6 +189,18 @@ couchTests.oauth_cache = function(debug) {
     joe_oauth_accessor = {
       consumerSecret: "one",
       tokenSecret: "zxc"
+    };
+    joe_oauth_msg2 = {
+      parameters: {
+        oauth_signature_method: "HMAC-SHA1",
+        oauth_consumer_key: "key_joe_2",
+        oauth_token: "tok_joe_2",
+        oauth_version: "1.0"
+      }
+    };
+    joe_oauth_accessor2 = {
+      consumerSecret: "two",
+      tokenSecret: "abc"
     };
 
     hits_before = hits();
@@ -181,7 +217,8 @@ couchTests.oauth_cache = function(debug) {
     hits_after = hits();
     misses_after = misses();
 
-    T(misses_after > misses_before, "# cache misses increased");
+    // +2, miss on user doc and oauth credentials
+    TEquals((misses_before + 2), misses_after);
     TEquals(hits_before, hits_after);
 
     hits_before = hits_after;
@@ -199,7 +236,8 @@ couchTests.oauth_cache = function(debug) {
     misses_after = misses();
 
     TEquals(misses_before, misses_after);
-    T(hits_after > hits_before, "# cache hits increased");
+    // +1, oauth cache hit, no user doc lookup
+    TEquals((hits_before + 1), hits_after);
 
     hits_before = hits_after;
     misses_before = misses_after;
@@ -215,7 +253,8 @@ couchTests.oauth_cache = function(debug) {
     hits_after = hits();
     misses_after = misses();
 
-    T(misses_after > misses_before, "# cache misses increased");
+    // +2, miss on user doc and oauth credentials
+    TEquals((misses_before + 2), misses_after);
     TEquals(hits_before, hits_after);
 
     hits_before = hits_after;
@@ -233,12 +272,111 @@ couchTests.oauth_cache = function(debug) {
     misses_after = misses();
 
     TEquals(misses_before, misses_after);
-    T(hits_after > hits_before, "# cache hits increased");
+    // +1, oauth cache hit, no user doc lookup
+    TEquals((hits_before + 1), hits_after);
 
     hits_before = hits_after;
     misses_before = misses_after;
 
-    // update Joe's token secret
+    // use joe's second token and consumer key
+
+    xhr = oauthRequest(
+      "GET", "http://" + host + "/_session",
+      joe_oauth_msg2, joe_oauth_accessor2);
+    TEquals(200, xhr.status);
+    data = JSON.parse(xhr.responseText);
+    TEquals(true, data.ok);
+    TEquals("joe", data.userCtx.name);
+
+    hits_after = hits();
+    misses_after = misses();
+
+    // +1, miss on oauth credentials
+    TEquals((misses_before + 1), misses_after);
+    // +1 because joe's user doc is cached
+    TEquals((hits_before + 1), hits_after);
+
+    hits_before = hits_after;
+    misses_before = misses_after;
+
+    xhr = oauthRequest(
+      "GET", "http://" + host + "/_session",
+      joe_oauth_msg2, joe_oauth_accessor2);
+    TEquals(200, xhr.status);
+    data = JSON.parse(xhr.responseText);
+    TEquals(true, data.ok);
+    TEquals("joe", data.userCtx.name);
+
+    hits_after = hits();
+    misses_after = misses();
+
+    TEquals(misses_before, misses_after);
+    // +1 because joe's user doc is cached
+    TEquals((hits_before + 1), hits_after);
+
+    hits_before = hits_after;
+    misses_before = misses_after;
+
+    // test delegated OAuth credentials in fdmanana's user doc
+    xhr = oauthRequest(
+      "GET", "http://" + host + "/_session", del_oauth_msg, del_oauth_accessor);
+    TEquals(200, xhr.status);
+    data = JSON.parse(xhr.responseText);
+    TEquals(true, data.ok);
+    TEquals("fil.delegated.test_db", data.userCtx.name);
+
+    hits_after = hits();
+    misses_after = misses();
+
+    // +1, miss on oauth credentials only
+    TEquals((misses_before + 1), misses_after);
+    TEquals(hits_before, hits_after);
+
+    hits_before = hits_after;
+    misses_before = misses_after;
+
+    xhr = oauthRequest(
+      "GET", "http://" + host + "/_session", del_oauth_msg, del_oauth_accessor);
+    TEquals(200, xhr.status);
+    data = JSON.parse(xhr.responseText);
+    TEquals(true, data.ok);
+    TEquals("fil.delegated.test_db", data.userCtx.name);
+
+    hits_after = hits();
+    misses_after = misses();
+
+    TEquals(misses_before, misses_after);
+    // +1, cache hit on oauth credentials, no user doc lookup
+    TEquals((hits_before + 1), hits_after);
+
+    hits_before = hits_after;
+    misses_before = misses_after;
+
+    // Authenticate with joe's second token and consumer key again.
+    // Because the OAuth cache uses a MRU eviction policy, it should
+    // cause a cache miss.
+
+    xhr = oauthRequest(
+      "GET", "http://" + host + "/_session",
+      joe_oauth_msg2, joe_oauth_accessor2);
+    TEquals(200, xhr.status);
+    data = JSON.parse(xhr.responseText);
+    TEquals(true, data.ok);
+    TEquals("joe", data.userCtx.name);
+
+    hits_after = hits();
+    misses_after = misses();
+
+    // 1 cache miss on oauth credentials, no user doc lookup
+    TEquals((misses_before + 1), misses_after);
+    // +1, cache hit when getting Joe's user doc
+    TEquals((hits_before + 1), hits_after);
+
+    hits_before = hits_after;
+    misses_before = misses_after;
+
+    // Update Joe's first token secret. This should make the cache daemon
+    // purge all the oauth credentials defined in Joe's user doc.
 
     joe.oauth.tokens["tok_joe_1"] = "new_secret";
     T(usersDb.save(joe).ok);
@@ -255,7 +393,8 @@ couchTests.oauth_cache = function(debug) {
     hits_after = hits();
     misses_after = misses();
 
-    T(misses_after > misses_before, "# cache misses increased");
+    // 1 cache miss on oauth credentials, no user doc lookup
+    TEquals((misses_before + 1), misses_after);
     TEquals((hits_before + 1), hits_after, "cache hits +1, user doc in cache");
 
     hits_before = hits_after;
@@ -273,7 +412,8 @@ couchTests.oauth_cache = function(debug) {
     hits_after = hits();
     misses_after = misses();
 
-    T(misses_after > misses_before, "# cache misses increased");
+    // 1 cache miss on user doc, no oauth credentials lookup
+    TEquals((misses_before + 1), misses_after);
     TEquals(hits_before, hits_after);
   }
 
