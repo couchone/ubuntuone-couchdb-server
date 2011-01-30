@@ -66,6 +66,7 @@ loadScript("script/oauth.js");
 loadScript("script/sha1.js");
 loadTest("oauth.js");
 loadTest("oauth_users_db.js");
+loadTest("oauth_delegation.js");
 loadTest("proxyauth.js");
 loadTest("purge.js");
 loadTest("reader_acl.js");
