@@ -220,8 +220,8 @@ couchTests.oauth_delegation = function(debug) {
     TEquals("joe.delegated.test_db", data.userCtx.name);
     TEquals(true, data.userCtx.roles instanceof Array);
     TEquals(2, data.userCtx.roles.length);
-    TEquals("cooker", data.userCtx.roles[0]);
-    TEquals("foo", data.userCtx.roles[1]);
+    TEquals("cooker.delegated.test_db", data.userCtx.roles[0]);
+    TEquals("foo.delegated.test_db", data.userCtx.roles[1]);
     TEquals("oauth", data.info.authenticated);
 
     // check if the delegated user Joe can access fdmanana's database
@@ -290,7 +290,7 @@ couchTests.oauth_delegation = function(debug) {
     TEquals(401, xhr.status);
 
     // now add one of joe's roles into the security object of the database
-    sec_obj.admins.roles = ["qwerty", "cooker"];
+    sec_obj.admins.roles = ["qwerty", "cooker.delegated.test_db"];
     xhr = oauthRequest(
       "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
         "/_security",

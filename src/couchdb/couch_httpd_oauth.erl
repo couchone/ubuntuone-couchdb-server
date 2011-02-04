@@ -440,10 +440,14 @@ access_token_info_map_fun() ->
                     emit(token, [doc.oauth.tokens[token], doc.name]);
                 }
                 var dels = doc.delegations || [];
-                var del_name, del_roles;
+                var del_name, del_roles, db;
                 for (var i = 0; i < dels.length; i++) {
-                    del_name = dels[i].name + '.delegated.' + dels[i].database;
+                    db = dels[i].database;
+                    del_name = dels[i].name + '.delegated.' + db;
                     del_roles = dels[i].roles || [];
+                    for (var r = 0; r < del_roles.length; r++) {
+                        del_roles[r] = del_roles[r] + '.delegated.' + db;
+                    }
                     emit(dels[i].oauth.token,
                         [dels[i].oauth.token_secret, del_name, del_roles]);
                 }
