@@ -16,7 +16,8 @@
 -record(user_ctx, {
     name = null,
     roles = [],
-    handler
+    handler,
+    delegated_databases = null
 }).
 
 default_config() ->

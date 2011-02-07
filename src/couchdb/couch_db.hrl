@@ -123,7 +123,8 @@
     {
     name=null,
     roles=[],
-    handler
+    handler,
+    delegated_databases = null
     }).
 
 % This should be updated anytime a header change happens that requires more

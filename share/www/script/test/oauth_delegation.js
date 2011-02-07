@@ -228,29 +228,29 @@ couchTests.oauth_delegation = function(debug) {
     // before his name or roles are added to that database's security
     // object - shouldn't be possible
 
-    xhr = oauthRequest(
-      "GET", "http://" + host + "/" + encDbPath("fdmanana", "test_db"),
-      joe_oauth_msg, joe_oauth_accessor);
-    TEquals(401, xhr.status);
-    data = JSON.parse(xhr.responseText);
-    TEquals("unauthorized", data.error);
+//     xhr = oauthRequest(
+//       "GET", "http://" + host + "/" + encDbPath("fdmanana", "test_db"),
+//       joe_oauth_msg, joe_oauth_accessor);
+//     TEquals(401, xhr.status);
+//     data = JSON.parse(xhr.responseText);
+//     TEquals("unauthorized", data.error);
 
-    // now user fdmanana adds delegated user joe to the security object
-    var sec_obj = {
-      admins: {
-        names: ["fdmanana"]
-      },
-      readers: {
-        names: ["joe.delegated.test_db"]
-      }
-    };
-    xhr = oauthRequest(
-      "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
-        "/_security",
-      oauth_msg, oauth_accessor, JSON.stringify(sec_obj));
-    TEquals(200, xhr.status);
-    data = JSON.parse(xhr.responseText);
-    TEquals(true, data.ok);
+//     // now user fdmanana adds delegated user joe to the security object
+//     var sec_obj = {
+//       admins: {
+//         names: ["fdmanana"]
+//       },
+//       readers: {
+//         names: ["joe.delegated.test_db"]
+//       }
+//     };
+//     xhr = oauthRequest(
+//       "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
+//         "/_security",
+//       oauth_msg, oauth_accessor, JSON.stringify(sec_obj));
+//     TEquals(200, xhr.status);
+//     data = JSON.parse(xhr.responseText);
+//     TEquals(true, data.ok);
 
     // joe should now be able to access the database
     xhr = oauthRequest(
@@ -283,21 +283,21 @@ couchTests.oauth_delegation = function(debug) {
       _id: "_design/joe",
       value: "ddoc"
     };
-    xhr = oauthRequest(
-      "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
-        "/" + new_doc._id,
-      joe_oauth_msg, joe_oauth_accessor, JSON.stringify(new_doc));
-    TEquals(401, xhr.status);
+//     xhr = oauthRequest(
+//       "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
+//         "/" + new_doc._id,
+//       joe_oauth_msg, joe_oauth_accessor, JSON.stringify(new_doc));
+//     TEquals(401, xhr.status);
 
     // now add one of joe's roles into the security object of the database
-    sec_obj.admins.roles = ["qwerty", "cooker.delegated.test_db"];
-    xhr = oauthRequest(
-      "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
-        "/_security",
-      oauth_msg, oauth_accessor, JSON.stringify(sec_obj));
-    TEquals(200, xhr.status);
-    data = JSON.parse(xhr.responseText);
-    TEquals(true, data.ok);
+//     sec_obj.admins.roles = ["qwerty", "cooker.delegated.test_db"];
+//     xhr = oauthRequest(
+//       "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
+//         "/_security",
+//       oauth_msg, oauth_accessor, JSON.stringify(sec_obj));
+//     TEquals(200, xhr.status);
+//     data = JSON.parse(xhr.responseText);
+//     TEquals(true, data.ok);
 
     xhr = oauthRequest(
       "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +

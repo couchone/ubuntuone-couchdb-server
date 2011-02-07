@@ -38,7 +38,8 @@
 -record(user_ctx, {
     name = null,
     roles = [],
-    handler
+    handler,
+    delegated_databases = null
 }).
 
 server() -> "http://127.0.0.1:5984/".

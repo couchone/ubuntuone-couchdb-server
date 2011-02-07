@@ -48,7 +48,7 @@
 -type roles() :: [binary()].
 -spec get_user_creds(UserName::string() | binary() | oauth_pair()) ->
     Credentials::list() |
-    {UserName::binary(), UserRoles::roles(),
+    {UserName::binary(), UserRoles::roles(), DelegationDb::binary(),
         ConsumerSecret::string(), TokenSecret::string()} |
     nil.
 
@@ -326,7 +326,7 @@ free_mru_cache_entry() ->
     true = ets:delete(?BY_ATIME, MruTime),
     true = ets:delete(?BY_USER, UserName).
 
-add_oauth_cache_entry(OAuthPair, {User, _, _, _} = Credentials, ATime, State) ->
+add_oauth_cache_entry(OAuthPair, {User, _, _, _, _} = Credentials, ATime, State) ->
     case State#state.num_oauth_pairs >= State#state.max_oauth_pairs of
     true ->
         free_oauth_mru_cache_entry();
@@ -350,7 +350,7 @@ free_oauth_mru_cache_entry() ->
     MruTime = ets:last(?BY_ATIME_OAUTH),
     [{MruTime, OAuthPair}] = ets:lookup(?BY_ATIME_OAUTH, MruTime),
     true = ets:delete(?BY_ATIME_OAUTH, MruTime),
-    [{OAuthPair, {{User, _, _, _}, MruTime}}] = ets:lookup(
+    [{OAuthPair, {{User, _, _, _, _}, MruTime}}] = ets:lookup(
         ?OAUTH_TO_CREDS, OAuthPair),
     true = ets:delete(?OAUTH_TO_CREDS, OAuthPair),
     true = ets:delete_object(?USER_TO_OAUTH_PAIRS, {User, OAuthPair}).
@@ -411,7 +411,7 @@ refresh_entry(Db, #doc_info{high_seq = DocSeq} = DocInfo) ->
         PairList ->
             lists:foreach(
                 fun({Name, Pair}) when Name =:= UserName ->
-                    [{Pair, {{Name, _, _, _}, T}}] = ets:lookup(
+                    [{Pair, {{Name, _, _, _, _}, T}}] = ets:lookup(
                         ?OAUTH_TO_CREDS, Pair),
                     true = ets:delete(?BY_ATIME_OAUTH, T),
                     true = ets:delete(?OAUTH_TO_CREDS, Pair)

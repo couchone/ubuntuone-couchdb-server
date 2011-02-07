@@ -23,7 +23,8 @@
     signature,
     params,
     username,
-    roles
+    roles,
+    database
 }).
 
 % OAuth auth handler using per-node user db
@@ -43,11 +44,12 @@ oauth_auth_callback(#httpd{mochi_req = MochiReq} = Req, CbParams) ->
         signature = Sig,
         params = Params,
         username = User,
-        roles = Roles
+        roles = Roles,
+        database = DelegationDb
     } = CbParams,
     case oauth:verify(Sig, Method, Url, Params, Consumer, TokenSecret) of
     true ->
-        set_user_ctx(Req, User, Roles);
+        set_user_ctx(Req, User, Roles, DelegationDb);
     false ->
         ?LOG_DEBUG("OAuth handler: signature verification failed for user ~p",
             [User]),
@@ -63,9 +65,9 @@ oauth_auth_callback(#httpd{mochi_req = MochiReq} = Req, CbParams) ->
     end.
 
 % Look up the consumer key and get the roles to give the consumer
-set_user_ctx(_Req, undefined, _DelegationRoles) ->
+set_user_ctx(_Req, undefined, _DelegationRoles, _DelegationDb) ->
     throw({bad_request, unknown_oauth_token});
-set_user_ctx(Req, Name, undefined) ->
+set_user_ctx(Req, Name, undefined, undefined) ->
     case couch_auth_cache:get_user_creds(Name) of
         nil ->
             ?LOG_DEBUG("OAuth handler: user ~p credentials not found", [Name]),
@@ -74,10 +76,19 @@ set_user_ctx(Req, Name, undefined) ->
             Roles = couch_util:get_value(<<"roles">>, User, []),
             Req#httpd{user_ctx=#user_ctx{name=Name, roles=Roles}}
     end;
-set_user_ctx(Req, Name, DelegationRoles) ->
-    ?LOG_DEBUG("Setting delegated oauth user_ctx, username: ~p, roles: ~p",
-        [Name, DelegationRoles]),
-    Req#httpd{user_ctx = #user_ctx{name = Name, roles = DelegationRoles}}.
+set_user_ctx(Req, Name, DelegationRoles, DelegationDb) ->
+    ?LOG_DEBUG("Setting delegated oauth user_ctx, username: ~p, "
+        "roles: ~p, database: ~p", [Name, DelegationRoles, DelegationDb]),
+    Req#httpd{user_ctx = #user_ctx{
+        name = Name,
+        roles = DelegationRoles,
+        delegated_databases = case DelegationDb of
+            undefined ->
+                null;
+            _ ->
+                [DelegationDb]
+            end
+    }}.
 
 % OAuth request_token
 handle_oauth_req(#httpd{path_parts=[_OAuth, <<"request_token">>], method=Method}=Req1) ->
@@ -246,43 +257,46 @@ get_oauth_callback_params(ConsumerKey, Params, Url) ->
                 {ok, CbParams};
             [TokenSecret, User1 | Rest] ->
                 User = ?l2b(User1),
-                Roles = case Rest of
+                {Roles, DelegationDb} = case Rest of
                 [] ->
                     case couch_auth_cache:get_user_creds(User) of
                     nil ->
-                        undefined;
+                        {undefined, undefined};
                     UserCreds ->
-                        couch_util:get_value(<<"roles">>, UserCreds, [])
+                        {couch_util:get_value(<<"roles">>, UserCreds, []), undefined}
                     end;
-                [DelegatedRoles] ->
-                    DelegatedRoles
+                [DelegatedRoles, Db, DelegatorUser] ->
+                    UserPrefix = couch_httpd_auth:username_to_prefix(DelegatorUser),
+                    {DelegatedRoles, <<UserPrefix/binary, Db/binary>>}
                 end,
                 CbParams = CbParams0#oauth_callback_params{
                     consumer = {ConsumerKey, ConsumerSecret, SigMethod},
                     token_secret = TokenSecret,
                     username = User,
-                    roles = Roles
+                    roles = Roles,
+                    database = DelegationDb
                 },
                 ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~s and Token ~s, "
                     "from the views, User: ~s, Roles: ~p, ConsumerSecret: ~s, "
-                    "TokenSecret: ~s",
-                    [ConsumerKey, Token, User, Roles, ConsumerSecret, TokenSecret]),
+                    "TokenSecret: ~s, DelegationDb: ~s",
+                    [ConsumerKey, Token, User, Roles, ConsumerSecret, TokenSecret, DelegationDb]),
                 ok = couch_auth_cache:add_oauth_creds(
                     {ConsumerKey, Token},
-                    {User, Roles, ConsumerSecret, TokenSecret}),
+                    {User, Roles, DelegationDb, ConsumerSecret, TokenSecret}),
                 {ok, CbParams}
             end
         end;
-    {UserName, Roles, ConsumerSecret, TokenSecret} ->
+    {UserName, Roles, DelegationDb, ConsumerSecret, TokenSecret} ->
         ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~s and Token ~s, "
             "from cache, User: ~s, Roles: ~p, ConsumerSecret: ~s, "
-            "TokenSecret: ~s",
-            [ConsumerKey, Token, UserName, Roles, ConsumerSecret, TokenSecret]),
+            "TokenSecret: ~s, DelegationDb: ~s",
+            [ConsumerKey, Token, UserName, Roles, ConsumerSecret, TokenSecret, DelegationDb]),
         CbParams = CbParams0#oauth_callback_params{
             consumer = {ConsumerKey, ConsumerSecret, SigMethod},
             token_secret = TokenSecret,
             username = UserName,
-            roles = Roles
+            roles = Roles,
+            database = DelegationDb
         },
         {ok, CbParams}
     end.
@@ -343,8 +357,8 @@ access_token_info(Token) ->
         case query_map_view(Db, ?DDOC_ID, <<"access_token_info">>, Token) of
         [] ->
             [undefined, undefined];
-        [[TokenSecret, Username | DelegatedRoles]] ->
-            [?b2l(TokenSecret), ?b2l(Username) | DelegatedRoles];
+        [[TokenSecret, Username | Rest]] ->
+            [?b2l(TokenSecret), ?b2l(Username) | Rest];
         Secrets ->
             UserList = [?b2l(U) || [_, U | _] <- Secrets],
             Reason = iolist_to_binary(
@@ -430,7 +444,8 @@ access_token_info_map_fun() ->
     % map results =>
     %     key: access_token,
     %     value: [access_token_secret, username] ||
-    %            [access_token_secret, delegation_username, delegation_roles]
+    %            [access_token_secret, delegation_username,
+    %                delegation_roles, delegation_database, delegator_user]
     % (username == resource owner in OAuth's jargon)
     % (For 2-legged OAuth the consumer is the same as the resource owner)
     <<"
@@ -449,7 +464,8 @@ access_token_info_map_fun() ->
                         del_roles[r] = del_roles[r] + '.delegated.' + db;
                     }
                     emit(dels[i].oauth.token,
-                        [dels[i].oauth.token_secret, del_name, del_roles]);
+                        [dels[i].oauth.token_secret,
+                            del_name, del_roles, db, doc.name]);
                 }
             }
         }
