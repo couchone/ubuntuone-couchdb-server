@@ -306,6 +306,20 @@ couchTests.oauth_delegation = function(debug) {
     TEquals(201, xhr.status);
     data = JSON.parse(xhr.responseText);
     TEquals(true, data.ok);
+
+    // let user fdmanana create another database
+    xhr = oauthRequest(
+      "PUT", "http://" + host + "/" + encDbPath("fdmanana", "top_secret"),
+       oauth_msg, oauth_accessor);
+    TEquals(201, xhr.status);
+    data = JSON.parse(xhr.responseText);
+    TEquals(true, data.ok);
+
+    // joe should not be able to access the new database
+    xhr = oauthRequest(
+      "GET", "http://" + host + "/" + encDbPath("fdmanana", "top_secret"),
+      joe_oauth_msg, joe_oauth_accessor);
+    TEquals(401, xhr.status);
   }
 
 
@@ -315,5 +329,6 @@ couchTests.oauth_delegation = function(debug) {
   // cleanup
   usersDb.deleteDb();
   (new CouchDB(dbPath("fdmanana", "test_db"))).deleteDb();
+  (new CouchDB(dbPath("fdmanana", "top_secret"))).deleteDb();
 
 };
