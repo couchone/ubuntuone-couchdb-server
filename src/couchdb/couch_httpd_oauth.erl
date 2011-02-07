@@ -58,7 +58,7 @@ oauth_auth_callback(#httpd{mochi_req = MochiReq} = Req, CbParams) ->
         ?LOG_DEBUG("OAuth handler: Consumer ~p, TokenSecret ~p",
             [Consumer, TokenSecret]),
         ?LOG_DEBUG("OAuth handler: expected signature ~p",
-            [oauth:signature(Method), Url, Params, Consumer, TokenSecret]),
+            [oauth:signature(Method, Url, Params, Consumer, TokenSecret)]),
         Req
     end.
 
