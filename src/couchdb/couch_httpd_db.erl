@@ -209,7 +209,11 @@ delete_db_req(#httpd{user_ctx=UserCtx}=Req, DbName) ->
     end.
 
 do_db_req(#httpd{user_ctx=UserCtx,path_parts=[DbName|_]}=Req, Fun) ->
-    case couch_db:open(DbName, [{user_ctx, UserCtx}]) of
+    OpenFun = case (catch couch_httpd_auth:verify_permission(DbName, UserCtx)) of
+    ok -> fun couch_db:open_int/2;
+    _ -> fun couch_db:open/2
+    end,
+    case OpenFun(DbName, [{user_ctx, UserCtx}]) of
     {ok, Db} ->
         try
             Fun(Req, Db)
