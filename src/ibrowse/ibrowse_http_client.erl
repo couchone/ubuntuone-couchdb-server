@@ -37,6 +37,7 @@
 -include("ibrowse.hrl").
 
 -record(state, {host, port, connect_timeout,
+                inactivity_timer_ref,
                 use_proxy = false, proxy_auth_digest,
                 ssl_options = [], is_ssl = false, socket,
                 proxy_tunnel_setup = false,
@@ -47,7 +48,8 @@
                 status_line, raw_headers, 
                 is_closing, send_timer, content_length,
                 deleted_crlf = false, transfer_encoding,
-                chunk_size, chunk_size_buffer = <<>>, recvd_chunk_size,
+                chunk_size, chunk_size_buffer = <<>>,
+                recvd_chunk_size, interim_reply_sent = false,
                 lb_ets_tid, cur_pipeline_size = 0, prev_req_id
                }).
 
@@ -57,7 +59,7 @@
                   req_id,
                   stream_chunk_size,
                   save_response_to_file = false, 
-                  tmp_file_name, tmp_file_fd,
+                  tmp_file_name, tmp_file_fd, preserve_chunked_encoding,
                   response_format}).
 
 -import(ibrowse_lib, [
@@ -67,7 +69,7 @@
                      ]).
 
 -define(DEFAULT_STREAM_CHUNK_SIZE, 1024*1024).
-
+-define(dec2hex(X), erlang:integer_to_list(X, 16)).
 %%====================================================================
 %% External functions
 %%====================================================================
@@ -82,8 +84,13 @@ start_link(Args) ->
     gen_server:start_link(?MODULE, Args, []).
 
 stop(Conn_pid) ->
-    catch gen_server:call(Conn_pid, stop),
-    ok.
+    case catch gen_server:call(Conn_pid, stop) of
+        {'EXIT', {timeout, _}} ->
+            exit(Conn_pid, kill),
+            ok;
+        _ ->
+            ok
+    end.
 
 send_req(Conn_Pid, Url, Headers, Method, Body, Options, Timeout) ->
     gen_server:call(
@@ -171,6 +178,7 @@ handle_cast(_Msg, State) ->
 %%          {stop, Reason, State}            (terminate/2 is called)
 %%--------------------------------------------------------------------
 handle_info({tcp, _Sock, Data}, #state{status = Status} = State) ->
+%%    io:format("Recvd data: ~p~n", [Data]),
     do_trace("Data recvd in state: ~p. Size: ~p. ~p~n~n", [Status, size(Data), Data]),
     handle_sock_data(Data, State);
 handle_info({ssl, _Sock, Data}, State) ->
@@ -178,13 +186,28 @@ handle_info({ssl, _Sock, Data}, State) ->
 
 handle_info({stream_next, Req_id}, #state{socket = Socket,
                                           cur_req = #request{req_id = Req_id}} = State) ->
+    %% io:format("Client process set {active, once}~n", []),
     do_setopts(Socket, [{active, once}], State),
-    {noreply, State};
+    {noreply, set_inac_timer(State)};
 
 handle_info({stream_next, _Req_id}, State) ->
+    _Cur_req_id = case State#state.cur_req of
+                     #request{req_id = Cur} ->
+                         Cur;
+                     _ ->
+                         undefined
+                 end,
+%%     io:format("Ignoring stream_next as ~1000.p is not cur req (~1000.p)~n",
+%%               [_Req_id, _Cur_req_id]),
     {noreply, State};
 
-handle_info({tcp_closed, _Sock}, State) ->
+handle_info({stream_close, _Req_id}, State) ->
+    shutting_down(State),
+    do_close(State),
+    do_error_reply(State, closing_on_request),
+    {stop, normal, State};
+
+handle_info({tcp_closed, _Sock}, State) ->    
     do_trace("TCP connection closed by peer!~n", []),
     handle_sock_closed(State),
     {stop, normal, State};
@@ -193,12 +216,14 @@ handle_info({ssl_closed, _Sock}, State) ->
     handle_sock_closed(State),
     {stop, normal, State};
 
-handle_info({tcp_error, _Sock}, State) ->
-    io:format("Error on connection to ~1000.p:~1000.p~n", [State#state.host, State#state.port]),
+handle_info({tcp_error, _Sock, Reason}, State) ->
+    do_trace("Error on connection to ~1000.p:~1000.p -> ~1000.p~n",
+             [State#state.host, State#state.port, Reason]),
     handle_sock_closed(State),
     {stop, normal, State};
-handle_info({ssl_error, _Sock}, State) ->
-    io:format("Error on SSL connection to ~1000.p:~1000.p~n", [State#state.host, State#state.port]),
+handle_info({ssl_error, _Sock, Reason}, State) ->
+    do_trace("Error on SSL connection to ~1000.p:~1000.p -> ~1000.p~n",
+             [State#state.host, State#state.port, Reason]),
     handle_sock_closed(State),
     {stop, normal, State};
 
@@ -213,6 +238,7 @@ handle_info({req_timedout, From}, State) ->
     end;
 
 handle_info(timeout, State) ->
+    do_trace("Inactivity timeout triggered. Shutting down connection~n", []),
     shutting_down(State),
     do_error_reply(State, req_timedout),
     {stop, normal, State};
@@ -233,7 +259,8 @@ handle_info(Info, State) ->
 %% Returns: any (ignored by gen_server)
 %%--------------------------------------------------------------------
 terminate(_Reason, State) ->
-    do_close(State).
+    do_close(State),
+    ok.
 
 %%--------------------------------------------------------------------
 %% Func: code_change/3
@@ -262,13 +289,18 @@ handle_sock_data(Data, #state{status = get_header}=State) ->
         {error, _Reason} ->
             shutting_down(State),
             {stop, normal, State};
-        State_1 ->
-            active_once(State_1),
-            set_inac_timer(State_1),
-            {noreply, State_1}
+        #state{socket = Socket, status = Status, cur_req = CurReq} = State_1 ->
+            case {Status, CurReq} of
+                {get_header, #request{caller_controls_socket = true}} ->
+                    do_setopts(Socket, [{active, once}], State_1);
+                _ ->
+                    active_once(State_1)
+            end,
+            {noreply, set_inac_timer(State_1)}
     end;
 
 handle_sock_data(Data, #state{status           = get_body,
+                              socket           = Socket,
                               content_length   = CL,
                               http_status_code = StatCode,
                               recvd_headers    = Headers,
@@ -283,8 +315,8 @@ handle_sock_data(Data, #state{status           = get_body,
                     {stop, normal, State};
                 State_1 ->
                     active_once(State_1),
-                    set_inac_timer(State_1),
-                    {noreply, State_1}
+                    State_2 = set_inac_timer(State_1),
+                    {noreply, State_2}
             end;
         _ ->
             case parse_11_response(Data, State) of
@@ -293,10 +325,28 @@ handle_sock_data(Data, #state{status           = get_body,
                     fail_pipelined_requests(State,
                                             {error, {Reason, {stat_code, StatCode}, Headers}}),
                     {stop, normal, State};
+                #state{cur_req = #request{caller_controls_socket = Ccs},
+                       interim_reply_sent = Irs} = State_1 ->
+                    case Irs of
+                        true ->
+                            active_once(State_1);
+                        false when Ccs == true ->
+                            do_setopts(Socket, [{active, once}], State);
+                        false ->
+                            active_once(State_1)
+                    end,
+                    State_2 = State_1#state{interim_reply_sent = false},
+                    case Ccs of
+                    true ->
+                        cancel_timer(State_2#state.inactivity_timer_ref, {eat_message, timeout}),
+                        {noreply, State_2#state{inactivity_timer_ref = undefined}};
+                    _ ->
+                        {noreply, set_inac_timer(State_2)}
+                    end;
                 State_1 ->
                     active_once(State_1),
-                    set_inac_timer(State_1),
-                    {noreply, State_1}
+                    State_2 = set_inac_timer(State_1),
+                    {noreply, State_2}
             end
     end.
 
@@ -338,17 +388,16 @@ accumulate_response(Data, #state{cur_req = #request{save_response_to_file = Srtf
         {error, Reason} ->
             {error, {file_write_error, Reason}}
     end;
-accumulate_response(<<>>, State) ->
-    State;
-accumulate_response(Data, #state{reply_buffer = RepBuf,
-                                 rep_buf_size = RepBufSize,
-                                 streamed_size = Streamed_size,
-                                 cur_req = CurReq}=State) ->
-    #request{stream_to=StreamTo, req_id=ReqId,
-             stream_chunk_size = Stream_chunk_size,
-             response_format = Response_format,
-             caller_controls_socket = Caller_controls_socket} = CurReq,
-    RepBuf_1 = list_to_binary([RepBuf, Data]),
+accumulate_response(Data, #state{reply_buffer      = RepBuf,
+                                 rep_buf_size      = RepBufSize,
+                                 streamed_size     = Streamed_size,
+                                 cur_req           = CurReq}=State) ->
+    #request{stream_to                 = StreamTo,
+             req_id                    = ReqId,
+             stream_chunk_size         = Stream_chunk_size,
+             response_format           = Response_format,
+             caller_controls_socket    = Caller_controls_socket} = CurReq,
+    RepBuf_1 = <<RepBuf/binary, Data/binary>>,
     New_data_size = RepBufSize - Streamed_size,
     case StreamTo of
         undefined ->
@@ -356,15 +405,21 @@ accumulate_response(Data, #state{reply_buffer = RepBuf,
         _ when Caller_controls_socket == true ->
             do_interim_reply(StreamTo, Response_format, ReqId, RepBuf_1),
             State#state{reply_buffer = <<>>, 
+                        interim_reply_sent = true,
                         streamed_size = Streamed_size + size(RepBuf_1)};
         _ when New_data_size >= Stream_chunk_size ->
             {Stream_chunk, Rem_data} = split_binary(RepBuf_1, Stream_chunk_size),
             do_interim_reply(StreamTo, Response_format, ReqId, Stream_chunk),
-            accumulate_response(
-              Rem_data,
-              State#state{
-                reply_buffer = <<>>,
-                streamed_size = Streamed_size + Stream_chunk_size});
+            State_1 = State#state{
+                        reply_buffer = <<>>,
+                        interim_reply_sent = true,
+                        streamed_size = Streamed_size + Stream_chunk_size},
+            case Rem_data of
+                <<>> ->
+                    State_1;
+                _ ->
+                    accumulate_response(Rem_data, State_1)
+            end;
         _ ->
             State#state{reply_buffer = RepBuf_1}
     end.
@@ -413,7 +468,7 @@ handle_sock_closed(#state{reply_buffer = Buf, reqs = Reqs, http_status_code = SC
                        undefined ->
                            Buf;
                        _ ->
-                           file:close(Fd),
+                           ok = file:close(Fd),
                            {file, TmpFilename}
                    end,
             Reply = case get_value(give_raw_headers, Options, false) of
@@ -422,11 +477,11 @@ handle_sock_closed(#state{reply_buffer = Buf, reqs = Reqs, http_status_code = SC
                         false ->
                             {ok, SC, Headers, Buf}
                     end,
-            do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
-            do_error_reply(State#state{reqs = Reqs_1}, connection_closed),
-            State;
+            State_1 = do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
+            ok = do_error_reply(State_1#state{reqs = Reqs_1}, connection_closed),
+            State_1;
         _ ->
-            do_error_reply(State, connection_closed),
+            ok = do_error_reply(State, connection_closed),
             State
     end.
 
@@ -434,17 +489,19 @@ do_connect(Host, Port, Options, #state{is_ssl      = true,
                                        use_proxy   = false,
                                        ssl_options = SSLOptions},
            Timeout) ->
+    ssl:connect(Host, Port, get_sock_options(Options, SSLOptions), Timeout);
+do_connect(Host, Port, Options, _State, Timeout) ->
+    gen_tcp:connect(Host, Port, get_sock_options(Options, []), Timeout).
+
+get_sock_options(Options, SSLOptions) ->
     Caller_socket_options = get_value(socket_options, Options, []),
     Other_sock_options = filter_sock_options(SSLOptions ++ Caller_socket_options),
-    ssl:connect(Host, Port,
-                [binary, {nodelay, true}, {active, false} | Other_sock_options],
-                Timeout);
-do_connect(Host, Port, Options, _State, Timeout) ->
-    Caller_socket_options = get_value(socket_options, Options, []),
-    Other_sock_options = filter_sock_options(Caller_socket_options),
-    gen_tcp:connect(Host, to_integer(Port),
-                    [binary, {nodelay, true}, {active, false} | Other_sock_options],
-                    Timeout).
+    case lists:keysearch(nodelay, 1, Other_sock_options) of
+        false ->
+            [{nodelay, true}, binary, {active, false} | Other_sock_options];
+        {value, _} ->
+            [binary, {active, false} | Other_sock_options]
+    end.
 
 %% We don't want the caller to specify certain options
 filter_sock_options(Opts) ->
@@ -470,37 +527,45 @@ do_send(Req, #state{socket = Sock, is_ssl = false}) ->  gen_tcp:send(Sock, Req).
 %%                       {fun_arity_0}         |
 %%                       {fun_arity_1, term()}
 %% error() = term()
-do_send_body(Source, State) when is_function(Source) ->
-    do_send_body({Source}, State);
-do_send_body({Source}, State) when is_function(Source) ->
-    do_send_body1(Source, Source(), State);
-do_send_body({Source, Source_state}, State) when is_function(Source) ->
-    do_send_body1(Source, Source(Source_state), State);
-do_send_body(Body, State) ->
+do_send_body(Source, State, TE) when is_function(Source) ->
+    do_send_body({Source}, State, TE);
+do_send_body({Source}, State, TE) when is_function(Source) ->
+    do_send_body1(Source, Source(), State, TE);
+do_send_body({Source, Source_state}, State, TE) when is_function(Source) ->
+    do_send_body1(Source, Source(Source_state), State, TE);
+do_send_body(Body, State, _TE) ->
     do_send(Body, State).
 
-do_send_body1(Source, Resp, State) ->
+do_send_body1(Source, Resp, State, TE) ->
     case Resp of
         {ok, Data} ->
-            do_send(Data, State),
-            do_send_body({Source}, State);
+            do_send(maybe_chunked_encode(Data, TE), State),
+            do_send_body({Source}, State, TE);
         {ok, Data, New_source_state} ->
-            do_send(Data, State),
-            do_send_body({Source, New_source_state}, State);
+            do_send(maybe_chunked_encode(Data, TE), State),
+            do_send_body({Source, New_source_state}, State, TE);
+        eof when TE == true ->
+            do_send(<<"0\r\n\r\n">>, State),
+            ok;
         eof ->
             ok;
         Err ->
             Err
     end.
 
+maybe_chunked_encode(Data, false) ->
+    Data;
+maybe_chunked_encode(Data, true) ->
+    [?dec2hex(iolist_size(Data)), "\r\n", Data, "\r\n"].
+
 do_close(#state{socket = undefined})            ->  ok;
 do_close(#state{socket = Sock,
                 is_ssl = true,
                 use_proxy = true,
                 proxy_tunnel_setup = Pts
-               }) when Pts /= done ->  gen_tcp:close(Sock);
-do_close(#state{socket = Sock, is_ssl = true})  ->  ssl:close(Sock);
-do_close(#state{socket = Sock, is_ssl = false}) ->  gen_tcp:close(Sock).
+               }) when Pts /= done ->  catch gen_tcp:close(Sock);
+do_close(#state{socket = Sock, is_ssl = true})  ->  catch ssl:close(Sock);
+do_close(#state{socket = Sock, is_ssl = false}) ->  catch gen_tcp:close(Sock).
 
 active_once(#state{cur_req = #request{caller_controls_socket = true}}) ->
     ok;
@@ -542,25 +607,17 @@ send_req_1(From,
         end,
     State_2 = check_ssl_options(Options, State_1),
     do_trace("Connecting...~n", []),
-    Start_ts = now(),
     Conn_timeout = get_value(connect_timeout, Options, Timeout),
     case do_connect(Host_1, Port_1, Options, State_2, Conn_timeout) of
         {ok, Sock} ->
-            do_trace("Connected!~n", []),
-            End_ts = now(),
-            Timeout_1 = case Timeout of
-                            infinity ->
-                                infinity;
-                            _ ->
-                                Timeout - trunc(round(timer:now_diff(End_ts, Start_ts) / 1000))
-                        end,
+            do_trace("Connected! Socket: ~1000.p~n", [Sock]),
             State_3 = State_2#state{socket = Sock,
                                     connect_timeout = Conn_timeout},
-            send_req_1(From, Url, Headers, Method, Body, Options, Timeout_1, State_3);
+            send_req_1(From, Url, Headers, Method, Body, Options, Timeout, State_3);
         Err ->
             shutting_down(State_2),
             do_trace("Error connecting. Reason: ~1000.p~n", [Err]),
-            gen_server:reply(From, {error, conn_failed}),
+            gen_server:reply(From, {error, {conn_failed, Err}}),
             {stop, normal, State_2}
     end;
 
@@ -580,20 +637,23 @@ send_req_1(From,
                   use_proxy = true,
                   is_ssl    = true} = State) ->
     NewReq = #request{
-      method                 = connect,
-      options                = Options
+      method                    = connect,
+      preserve_chunked_encoding = get_value(preserve_chunked_encoding, Options, false),
+      options                   = Options
      },
     State_1 = State#state{reqs=queue:in(NewReq, State#state.reqs)},
     Pxy_auth_headers = maybe_modify_headers(Url, Method, Options, [], State_1),
     Path = [Server_host, $:, integer_to_list(Server_port)],
     {Req, Body_1} = make_request(connect, Pxy_auth_headers,
                                  Path, Path,
-                                 [], Options, State_1),
+                                 [], Options, State_1, undefined),
+    TE = is_chunked_encoding_specified(Options),
     trace_request(Req),
     case do_send(Req, State) of
         ok ->
-            case do_send_body(Body_1, State_1) of
+            case do_send_body(Body_1, State_1, TE) of
                 ok ->
+                    trace_request_body(Body_1),
                     active_once(State_1),
                     Ref = case Timeout of
                               infinity ->
@@ -606,18 +666,18 @@ send_req_1(From,
                                             send_timer = Ref,
                                             proxy_tunnel_setup = in_progress,
                                             tunnel_setup_queue = [{From, Url, Headers, Method, Body, Options, Timeout}]},
-                    set_inac_timer(State_1),
-                    {noreply, State_2};
+                    State_3 = set_inac_timer(State_2),
+                    {noreply, State_3};
                 Err ->
                     shutting_down(State_1),
                     do_trace("Send failed... Reason: ~p~n", [Err]),
-                    gen_server:reply(From, {error, send_failed}),
+                    gen_server:reply(From, {error, {send_failed, Err}}),
                     {stop, normal, State_1}
             end;
         Err ->
             shutting_down(State_1),
             do_trace("Send failed... Reason: ~p~n", [Err]),
-            gen_server:reply(From, {error, send_failed}),
+            gen_server:reply(From, {error, {send_failed, Err}}),
             {stop, normal, State_1}
     end;
 
@@ -635,8 +695,8 @@ send_req_1(From,
                 path    = RelPath} = Url,
            Headers, Method, Body, Options, Timeout,
            #state{status    = Status,
-                  socket    = Socket,
-                  is_ssl    = Is_ssl} = State) ->
+                  socket    = Socket} = State) ->
+    cancel_timer(State#state.inactivity_timer_ref, {eat_message, timeout}),
     ReqId = make_req_id(),
     Resp_format = get_value(response_format, Options, list),
     Caller_socket_options = get_value(socket_options, Options, []),
@@ -666,18 +726,23 @@ send_req_1(From,
                       save_response_to_file  = SaveResponseToFile,
                       stream_chunk_size      = get_stream_chunk_size(Options),
                       response_format        = Resp_format,
-                      from                   = From},
+                      from                   = From,
+                      preserve_chunked_encoding = get_value(preserve_chunked_encoding, Options, false)
+                     },
     State_1 = State#state{reqs=queue:in(NewReq, State#state.reqs)},
     Headers_1 = maybe_modify_headers(Url, Method, Options, Headers, State_1),
     {Req, Body_1} = make_request(Method,
                                  Headers_1,
-                                 AbsPath, RelPath, Body, Options, State_1),
+                                 AbsPath, RelPath, Body, Options, State_1,
+                                 ReqId),
     trace_request(Req),
-    do_setopts(Socket, Caller_socket_options, Is_ssl),
+    do_setopts(Socket, Caller_socket_options, State_1),
+    TE = is_chunked_encoding_specified(Options),
     case do_send(Req, State_1) of
         ok ->
-            case do_send_body(Body_1, State_1) of
+            case do_send_body(Body_1, State_1, TE) of
                 ok ->
+                    trace_request_body(Body_1),
                     State_2 = inc_pipeline_counter(State_1),
                     active_once(State_2),
                     Ref = case Timeout of
@@ -700,18 +765,18 @@ send_req_1(From,
                         _ ->
                             gen_server:reply(From, {ibrowse_req_id, ReqId})
                     end,
-                    set_inac_timer(State_1),
-                    {noreply, State_3};
+                    State_4 = set_inac_timer(State_3),
+                    {noreply, State_4};
                 Err ->
                     shutting_down(State_1),
                     do_trace("Send failed... Reason: ~p~n", [Err]),
-                    gen_server:reply(From, {error, send_failed}),
+                    gen_server:reply(From, {error, {send_failed, Err}}),
                     {stop, normal, State_1}
             end;
         Err ->
             shutting_down(State_1),
             do_trace("Send failed... Reason: ~p~n", [Err]),
-            gen_server:reply(From, {error, send_failed}),
+            gen_server:reply(From, {error, {send_failed, Err}}),
             {stop, normal, State_1}
     end.
 
@@ -727,6 +792,7 @@ maybe_modify_headers(#url{host = Host, port = Port} = Url,
                                   false ->
                                       case Port of
                                           80 -> Host;
+                                          443 -> Host;
                                           _ -> [Host, ":", integer_to_list(Port)]
                                       end;
                                   {value, {_, Host_h_val}} ->
@@ -768,42 +834,71 @@ http_auth_digest(Username, Password) ->
     ibrowse_lib:encode_base64(Username ++ [$: | Password]).
 
 make_request(Method, Headers, AbsPath, RelPath, Body, Options,
-             #state{use_proxy = UseProxy}) ->
+             #state{use_proxy = UseProxy, is_ssl = Is_ssl}, ReqId) ->
     HttpVsn = http_vsn_string(get_value(http_vsn, Options, {1,1})),
+    Fun1 = fun({X, Y}) when is_atom(X) ->
+                   {to_lower(atom_to_list(X)), X, Y};
+              ({X, Y}) when is_list(X) ->
+                   {to_lower(X), X, Y}
+           end,
+    Headers_0 = [Fun1(X) || X <- Headers],
     Headers_1 =
-        case get_value(content_length, Headers, false) of
-            false when (Body == []) or
-                       (Body == <<>>) or
-                       is_tuple(Body) or
-                       is_function(Body) ->
-                Headers;
-            false when is_binary(Body) ->
-                [{"content-length", integer_to_list(size(Body))} | Headers];
-            false ->
-                [{"content-length", integer_to_list(length(Body))} | Headers];
+        case lists:keysearch("content-length", 1, Headers_0) of
+            false when (Body =:= [] orelse Body =:= <<>>) andalso
+                       (Method =:= post orelse Method =:= put) ->
+                [{"content-length", "Content-Length", "0"} | Headers_0];
+            false when is_binary(Body) orelse is_list(Body) ->
+                [{"content-length", "Content-Length", integer_to_list(iolist_size(Body))} | Headers_0];
             _ ->
-                Headers
+                %% Content-Length is already specified or Body is a
+                %% function or function/state pair
+                Headers_0
         end,
     {Headers_2, Body_1} =
-        case get_value(transfer_encoding, Options, false) of
+        case is_chunked_encoding_specified(Options) of
             false ->
-                {Headers_1, Body};
-            {chunked, ChunkSize} ->
-                {[{X, Y} || {X, Y} <- Headers_1,
-                            X /= "Content-Length",
-                            X /= "content-length",
-                            X /= content_length] ++
+                {[{Y, Z} || {_, Y, Z} <- Headers_1], Body};
+            true ->
+                Chunk_size_1 = case get_value(transfer_encoding, Options) of
+                                  chunked ->
+                                      5120;
+                                  {chunked, Chunk_size} ->
+                                      Chunk_size
+                              end,
+                {[{Y, Z} || {X, Y, Z} <- Headers_1,
+                            X /= "content-length"] ++
                  [{"Transfer-Encoding", "chunked"}],
-                 chunk_request_body(Body, ChunkSize)}
+                 chunk_request_body(Body, Chunk_size_1)}
         end,
-    Headers_3 = cons_headers(Headers_2),
+    Headers_3 = case lists:member({include_ibrowse_req_id, true}, Options) of
+                    true ->
+                        [{"x-ibrowse-request-id", io_lib:format("~1000.p",[ReqId])} | Headers_2];
+                    false ->
+                        Headers_2
+                end,
+    Headers_4 = cons_headers(Headers_3),
     Uri = case get_value(use_absolute_uri, Options, false) or UseProxy of
               true ->
-                  AbsPath;
+                  case Is_ssl of
+                      true ->
+                          RelPath;
+                      false ->
+                          AbsPath
+                  end;
               false ->
                   RelPath
           end,
-    {[method(Method), " ", Uri, " ", HttpVsn, crnl(), Headers_3, crnl()], Body_1}.
+    {[method(Method), " ", Uri, " ", HttpVsn, crnl(), Headers_4, crnl()], Body_1}.
+
+is_chunked_encoding_specified(Options) ->
+    case get_value(transfer_encoding, Options, false) of
+        false ->
+            false;
+        {chunked, _} -> 
+            true;
+        chunked ->
+            true
+    end.
 
 http_vsn_string({0,9}) -> "HTTP/0.9";
 http_vsn_string({1,0}) -> "HTTP/1.0";
@@ -836,6 +931,9 @@ encode_headers([{Name,Val} | T], Acc) when is_atom(Name) ->
 encode_headers([], Acc) ->
     lists:reverse(Acc).
 
+chunk_request_body(Body, _ChunkSize) when is_tuple(Body) orelse
+                                          is_function(Body) ->
+    Body;
 chunk_request_body(Body, ChunkSize) ->
     chunk_request_body(Body, ChunkSize, []).
 
@@ -845,23 +943,23 @@ chunk_request_body(Body, _ChunkSize, Acc) when Body == <<>>; Body == [] ->
 chunk_request_body(Body, ChunkSize, Acc) when is_binary(Body),
                                               size(Body) >= ChunkSize ->
     <<ChunkBody:ChunkSize/binary, Rest/binary>> = Body,
-    Chunk = [ibrowse_lib:dec2hex(4, ChunkSize),"\r\n",
+    Chunk = [?dec2hex(ChunkSize),"\r\n",
              ChunkBody, "\r\n"],
     chunk_request_body(Rest, ChunkSize, [Chunk | Acc]);
 chunk_request_body(Body, _ChunkSize, Acc) when is_binary(Body) ->
     BodySize = size(Body),
-    Chunk = [ibrowse_lib:dec2hex(4, BodySize),"\r\n",
+    Chunk = [?dec2hex(BodySize),"\r\n",
              Body, "\r\n"],
     LastChunk = "0\r\n",
     lists:reverse(["\r\n", LastChunk, Chunk | Acc]);
 chunk_request_body(Body, ChunkSize, Acc) when length(Body) >= ChunkSize ->
     {ChunkBody, Rest} = split_list_at(Body, ChunkSize),
-    Chunk = [ibrowse_lib:dec2hex(4, ChunkSize),"\r\n",
+    Chunk = [?dec2hex(ChunkSize),"\r\n",
              ChunkBody, "\r\n"],
     chunk_request_body(Rest, ChunkSize, [Chunk | Acc]);
 chunk_request_body(Body, _ChunkSize, Acc) when is_list(Body) ->
     BodySize = length(Body),
-    Chunk = [ibrowse_lib:dec2hex(4, BodySize),"\r\n",
+    Chunk = [?dec2hex(BodySize),"\r\n",
              Body, "\r\n"],
     LastChunk = "0\r\n",
     lists:reverse(["\r\n", LastChunk, Chunk | Acc]).
@@ -1017,24 +1115,24 @@ upgrade_to_ssl(#state{socket = Socket,
             send_queued_requests(lists:reverse(Q), State_1);
         Err ->
             do_trace("Upgrade to SSL socket failed. Reson: ~p~n", [Err]),
-            do_error_reply(State, {error, send_failed}),
+            do_error_reply(State, {error, {send_failed, Err}}),
             {error, send_failed}
     end.
 
 send_queued_requests([], State) ->
     do_trace("Sent all queued requests via SSL connection~n", []),
-    State#state{tunnel_setup_queue = done};
+    State#state{tunnel_setup_queue = []};
 send_queued_requests([{From, Url, Headers, Method, Body, Options, Timeout} | Q],
                      State) ->
     case send_req_1(From, Url, Headers, Method, Body, Options, Timeout, State) of
         {noreply, State_1} ->
             send_queued_requests(Q, State_1);
-        _ ->
+        Err ->
             do_trace("Error sending queued SSL request: ~n"
                      "URL     : ~s~n"
                      "Method  : ~p~n"
                      "Headers : ~p~n", [Url, Method, Headers]),
-            do_error_reply(State, {error, send_failed}),
+            do_error_reply(State, {error, {send_failed, Err}}),
             {error, send_failed}
     end.
 
@@ -1046,11 +1144,12 @@ is_connection_closing(_, _)                -> false.
 %% This clause determines the chunk size when given data from the beginning of the chunk
 parse_11_response(DataRecvd,
                   #state{transfer_encoding = chunked, 
-                         chunk_size = chunk_start,
+                         chunk_size        = chunk_start,
                          chunk_size_buffer = Chunk_sz_buf
                         } = State) ->
     case scan_crlf(Chunk_sz_buf, DataRecvd) of
         {yes, ChunkHeader, Data_1} ->
+            State_1 = maybe_accumulate_ce_data(State, <<ChunkHeader/binary, $\r, $\n>>),
             ChunkSize = parse_chunk_header(ChunkHeader),
             %%
             %% Do we have to preserve the chunk encoding when
@@ -1061,17 +1160,12 @@ parse_11_response(DataRecvd,
             RemLen = size(Data_1),
             do_trace("Determined chunk size: ~p. Already recvd: ~p~n",
                      [ChunkSize, RemLen]),
-            parse_11_response(Data_1, State#state{chunk_size_buffer = <<>>,
-                                                  deleted_crlf = true,
-                                                  recvd_chunk_size = 0,
-                                                  chunk_size = ChunkSize});
+            parse_11_response(Data_1, State_1#state{chunk_size_buffer = <<>>,
+                                                    deleted_crlf = true,
+                                                    recvd_chunk_size = 0,
+                                                    chunk_size = ChunkSize});
         {no, Data_1} ->
-            case get_more_chunked_data(1, <<>>, State) of
-            <<>> ->
-                State#state{chunk_size_buffer = Data_1};
-            Data_2 ->
-                parse_11_response(<<Data_1/binary, Data_2/binary>>, State)
-            end
+            State#state{chunk_size_buffer = Data_1}
     end;
 
 %% This clause is to remove the CRLF between two chunks
@@ -1079,13 +1173,15 @@ parse_11_response(DataRecvd,
 parse_11_response(DataRecvd,
                   #state{transfer_encoding = chunked, 
                          chunk_size = tbd,
-                         chunk_size_buffer = Buf}=State) ->
+                         chunk_size_buffer = Buf
+                        } = State) ->
     case scan_crlf(Buf, DataRecvd) of
         {yes, _, NextChunk} ->
-            State_1 = State#state{chunk_size = chunk_start,
-                                  chunk_size_buffer = <<>>,
-                                  deleted_crlf = true},
-            parse_11_response(NextChunk, State_1);
+            State_1 = maybe_accumulate_ce_data(State, <<$\r, $\n>>),
+            State_2 = State_1#state{chunk_size = chunk_start,
+                                    chunk_size_buffer = <<>>,
+                                    deleted_crlf = true},
+            parse_11_response(NextChunk, State_2);
         {no, Data_1} ->
             State#state{chunk_size_buffer = Data_1}
     end;
@@ -1095,9 +1191,10 @@ parse_11_response(DataRecvd,
 %% received is silently discarded.
 parse_11_response(DataRecvd,
                   #state{transfer_encoding = chunked, chunk_size = 0, 
-                         cur_req = CurReq,
-                         deleted_crlf = DelCrlf,
-                         chunk_size_buffer = Trailer, reqs = Reqs}=State) ->
+                         cur_req           = CurReq,
+                         deleted_crlf      = DelCrlf,
+                         chunk_size_buffer = Trailer,
+                         reqs              = Reqs} = State) ->
     do_trace("Detected end of chunked transfer...~n", []),
     DataRecvd_1 = case DelCrlf of
                       false ->
@@ -1106,12 +1203,14 @@ parse_11_response(DataRecvd,
                           <<$\r, $\n, DataRecvd/binary>>
                   end,
     case scan_header(Trailer, DataRecvd_1) of
-        {yes, _TEHeaders, Rem} ->
+        {yes, TEHeaders, Rem} ->
             {_, Reqs_1} = queue:out(Reqs),
-            State_1 = handle_response(CurReq, State#state{reqs = Reqs_1}),
-            parse_response(Rem, reset_state(State_1));
+            State_1 = maybe_accumulate_ce_data(State, <<TEHeaders/binary, $\r, $\n>>),
+            State_2 = handle_response(CurReq,
+                                      State_1#state{reqs = Reqs_1}),
+            parse_response(Rem, reset_state(State_2));
         {no, Rem} ->
-            State#state{chunk_size_buffer = Rem, deleted_crlf = false}
+            accumulate_response(<<>>, State#state{chunk_size_buffer = Rem, deleted_crlf = false})
     end;
 
 %% This clause extracts a chunk, given the size.
@@ -1125,21 +1224,21 @@ parse_11_response(DataRecvd,
     do_trace("Recvd more data: size: ~p. NeedBytes: ~p~n", [DataLen, NeedBytes]),
     case DataLen >= NeedBytes of
         true ->
-            process_chunk(NeedBytes, DataRecvd, State);
+            {RemChunk, RemData} = split_binary(DataRecvd, NeedBytes),
+            do_trace("Recvd another chunk...~p~n", [RemChunk]),
+            do_trace("RemData -> ~p~n", [RemData]),
+            case accumulate_response(RemChunk, State) of
+                {error, Reason} ->
+                    do_trace("Error accumulating response --> ~p~n", [Reason]),
+                    {error, Reason};
+                #state{} = State_1 ->
+                    State_2 = State_1#state{chunk_size=tbd},
+                    parse_11_response(RemData, State_2)
+            end;
         false ->
-            RestData = get_more_chunked_data(NeedBytes, <<>>, State),
-            DataRecvd2 = <<DataRecvd/binary, RestData/binary>>,
-            do_trace("Second recvd more data: size: ~p~n", [size(DataRecvd2)]),
-            case size(RestData) >= NeedBytes of
-            true ->
-                process_chunk(NeedBytes, DataRecvd2, State);
-            false ->
-                State2 = State#state{
-                    rep_buf_size = RepBufSz + size(DataRecvd2),
-                    recvd_chunk_size = Recvd_csz + size(DataRecvd2)
-                },
-                accumulate_response(DataRecvd2, State2)
-            end
+            accumulate_response(DataRecvd,
+                                State#state{rep_buf_size = RepBufSz + DataLen,
+                                            recvd_chunk_size = Recvd_csz + DataLen})
     end;
 
 %% This clause to extract the body when Content-Length is specified
@@ -1160,6 +1259,11 @@ parse_11_response(DataRecvd,
             accumulate_response(DataRecvd, State#state{rep_buf_size = (RepBufSz+DataLen)})
     end.
 
+maybe_accumulate_ce_data(#state{cur_req = #request{preserve_chunked_encoding = false}} = State, _) ->
+    State;
+maybe_accumulate_ce_data(State, Data) ->
+    accumulate_response(Data, State).
+
 handle_response(#request{from=From, stream_to=StreamTo, req_id=ReqId,
                          response_format = Resp_format,
                          save_response_to_file = SaveResponseToFile,
@@ -1174,49 +1278,42 @@ handle_response(#request{from=From, stream_to=StreamTo, req_id=ReqId,
                        reply_buffer  = RepBuf,
                        recvd_headers = RespHeaders}=State) when SaveResponseToFile /= false ->
     Body = RepBuf,
-    State_1 = set_cur_request(State),
-    file:close(Fd),
+    ok = file:close(Fd),
     ResponseBody = case TmpFilename of
                        undefined ->
                            Body;
                        _ ->
                            {file, TmpFilename}
                    end,
+    {Resp_headers_1, Raw_headers_1} = maybe_add_custom_headers(RespHeaders, Raw_headers, Options),
     Reply = case get_value(give_raw_headers, Options, false) of
                 true ->
-                    {ok, Status_line, Raw_headers, ResponseBody};
+                    {ok, Status_line, Raw_headers_1, ResponseBody};
                 false ->
-                    {ok, SCode, RespHeaders, ResponseBody}
+                    {ok, SCode, Resp_headers_1, ResponseBody}
             end,
-    State_2 = do_reply(State_1, From, StreamTo, ReqId, Resp_format, Reply),
+    State_1 = do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
     cancel_timer(ReqTimer, {eat_message, {req_timedout, From}}),
-    State_2;
+    set_cur_request(State_1);
 handle_response(#request{from=From, stream_to=StreamTo, req_id=ReqId,
                          response_format = Resp_format,
                          options = Options},
                 #state{http_status_code = SCode,
                        status_line      = Status_line,
                        raw_headers      = Raw_headers,
-                       recvd_headers    = RespHeaders,
+                       recvd_headers    = Resp_headers,
                        reply_buffer     = RepBuf,
                        send_timer       = ReqTimer} = State) ->
     Body = RepBuf,
-%%    State_1 = set_cur_request(State),
+    {Resp_headers_1, Raw_headers_1} = maybe_add_custom_headers(Resp_headers, Raw_headers, Options),
     Reply = case get_value(give_raw_headers, Options, false) of
                 true ->
-                    {ok, Status_line, Raw_headers, Body};
+                    {ok, Status_line, Raw_headers_1, Body};
                 false ->
-                    {ok, SCode, RespHeaders, Body}
+                    {ok, SCode, Resp_headers_1, Body}
             end,
-    State_1 = case get(conn_close) of
-        "close" ->
-            do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
-            exit(normal);
-        _ ->
-            State_1_1 = do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
-            cancel_timer(ReqTimer, {eat_message, {req_timedout, From}}),
-            State_1_1
-    end,
+    State_1 = do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
+    cancel_timer(ReqTimer, {eat_message, {req_timedout, From}}),
     set_cur_request(State_1).
 
 reset_state(State) ->
@@ -1232,13 +1329,20 @@ reset_state(State) ->
                 deleted_crlf      = false,
                 http_status_code  = undefined,
                 chunk_size        = undefined,
-                transfer_encoding = undefined}.
+                transfer_encoding = undefined
+               }.
 
-set_cur_request(#state{reqs = Reqs} = State) ->
+set_cur_request(#state{reqs = Reqs, socket = Socket} = State) ->
     case queue:to_list(Reqs) of
         [] ->
             State#state{cur_req = undefined};
-        [NextReq | _] ->
+        [#request{caller_controls_socket = Ccs} = NextReq | _] ->
+            case Ccs of
+                true ->
+                    do_setopts(Socket, [{active, once}], State);
+                _ ->
+                    ok
+            end,
             State#state{cur_req = NextReq}
     end.
 
@@ -1307,6 +1411,8 @@ parse_status_line([32 | T], get_prot_vsn, ProtVsn, StatCode) ->
     parse_status_line(T, get_status_code, ProtVsn, StatCode);
 parse_status_line([32 | T], get_status_code, ProtVsn, StatCode) ->
     {ok, lists:reverse(ProtVsn), lists:reverse(StatCode), T};
+parse_status_line([], get_status_code, ProtVsn, StatCode) ->
+    {ok, lists:reverse(ProtVsn), lists:reverse(StatCode), []};
 parse_status_line([H | T], get_prot_vsn, ProtVsn, StatCode) ->
     parse_status_line(T, get_prot_vsn, [H|ProtVsn], StatCode);
 parse_status_line([H | T], get_status_code, ProtVsn, StatCode) ->
@@ -1454,37 +1560,6 @@ parse_chunk_header(<<H, T/binary>>, Acc) ->
 parse_chunk_header(<<>>, Acc) ->
     hexlist_to_integer(lists:reverse(Acc)).
 
-process_chunk(NeedBytes, DataRecvd, State) ->
-    {RemChunk, RemData} = split_binary(DataRecvd, NeedBytes),
-    do_trace("Recvd another chunk...~n", []),
-    do_trace("RemData -> ~p~n", [RemData]),
-    case accumulate_response(RemChunk, State) of
-        {error, Reason} ->
-            do_trace("Error accumulating response --> ~p~n", [Reason]),
-            {error, Reason};
-        #state{} = State_1 ->
-            State_2 = State_1#state{chunk_size=tbd},
-            parse_11_response(RemData, State_2)
-    end.
-
-get_more_chunked_data(NeedBytes, Acc, _State) when size(Acc) >= NeedBytes ->
-    Acc;
-get_more_chunked_data(NeedBytes, Acc, #state{socket = Socket} = State) ->
-    do_setopts(Socket, [{active, once}], State),
-    Timeout = get_inac_timeout(State),
-    receive
-    {Type, Socket, Data} when Type =:= tcp ; Type =:= ssl ->
-        get_more_chunked_data(NeedBytes, <<Acc/binary, Data/binary>>, State);
-    {Type, Socket} = Msg
-        when Type =:= tcp_closed ; Type =:= tcp_error ;
-            Type =:= ssl_closed ; Type =:= ssl_error ->
-        self() ! Msg,
-        Acc
-    after Timeout ->
-        self() ! timeout,
-        Acc
-    end.
-
 is_whitespace($\s)  -> true;
 is_whitespace($\r) -> true;
 is_whitespace($\n) -> true;
@@ -1495,14 +1570,28 @@ send_async_headers(_ReqId, undefined, _, _State) ->
     ok;
 send_async_headers(ReqId, StreamTo, Give_raw_headers, 
                    #state{status_line = Status_line, raw_headers = Raw_headers, 
-                          recvd_headers = Headers, http_status_code = StatCode
-                          }) ->
+                          recvd_headers = Headers, http_status_code = StatCode,
+                          cur_req = #request{options = Opts}
+                         }) ->
+    {Headers_1, Raw_headers_1} = maybe_add_custom_headers(Headers, Raw_headers, Opts),
     case Give_raw_headers of
         false ->
-            catch StreamTo ! {ibrowse_async_headers, ReqId, StatCode, Headers};
+            catch StreamTo ! {ibrowse_async_headers, ReqId, StatCode, Headers_1};
         true ->
-            catch StreamTo ! {ibrowse_async_headers, ReqId, Status_line, Raw_headers}
+            catch StreamTo ! {ibrowse_async_headers, ReqId, Status_line, Raw_headers_1}
     end.
+
+maybe_add_custom_headers(Headers, Raw_headers, Opts) ->
+    Custom_headers = get_value(add_custom_headers, Opts, []),
+    Headers_1 = Headers ++ Custom_headers,
+    Raw_headers_1 = case Custom_headers of
+                        [_ | _] when is_binary(Raw_headers) ->
+                            Custom_headers_bin = list_to_binary(string:join([[X, $:, Y] || {X, Y} <- Custom_headers], "\r\n")),
+                            <<Raw_headers/binary, "\r\n", Custom_headers_bin/binary>>;
+                        _ ->
+                            Raw_headers
+                    end,
+    {Headers_1, Raw_headers_1}.
 
 format_response_data(Resp_format, Body) ->
     case Resp_format of
@@ -1576,8 +1665,8 @@ fail_pipelined_requests(#state{reqs = Reqs, cur_req = CurReq} = State, Reply) ->
     {_, Reqs_1} = queue:out(Reqs),
     #request{from=From, stream_to=StreamTo, req_id=ReqId,
              response_format = Resp_format} = CurReq,
-    do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
-    do_error_reply(State#state{reqs = Reqs_1}, previous_request_failed).
+    State_1 = do_reply(State, From, StreamTo, ReqId, Resp_format, Reply),
+    do_error_reply(State_1#state{reqs = Reqs_1}, previous_request_failed).
 
 split_list_at(List, N) ->
     split_list_at(List, N, []).
@@ -1621,7 +1710,8 @@ to_ascii($9) -> 9;
 to_ascii($0) -> 0.
 
 cancel_timer(undefined) -> ok;
-cancel_timer(Ref)       -> erlang:cancel_timer(Ref).
+cancel_timer(Ref)       -> _ = erlang:cancel_timer(Ref),
+                           ok.
 
 cancel_timer(Ref, {eat_message, Msg}) ->
     cancel_timer(Ref),
@@ -1681,28 +1771,58 @@ get_stream_chunk_size(Options) ->
     end.
 
 set_inac_timer(State) ->
-    set_inac_timer(State, get_inac_timeout(State)).
+    cancel_timer(State#state.inactivity_timer_ref),
+    set_inac_timer(State#state{inactivity_timer_ref = undefined},
+                   get_inac_timeout(State)).
 
-set_inac_timer(_State, Timeout) when is_integer(Timeout) ->
-    erlang:send_after(Timeout, self(), timeout);
-set_inac_timer(_, _) ->
-    undefined.
+set_inac_timer(State, Timeout) when is_integer(Timeout) ->
+    Ref = erlang:send_after(Timeout, self(), timeout),
+    State#state{inactivity_timer_ref = Ref};
+set_inac_timer(State, _) ->
+    State.
 
 get_inac_timeout(#state{cur_req = #request{options = Opts}}) -> 
     get_value(inactivity_timeout, Opts, infinity);
 get_inac_timeout(#state{cur_req = undefined}) ->
-    infinity.
+    case ibrowse:get_config_value(inactivity_timeout, undefined) of
+        Val when is_integer(Val) ->
+            Val;
+        _ ->
+            case application:get_env(ibrowse, inactivity_timeout) of
+                {ok, Val} when is_integer(Val), Val > 0 ->
+                    Val;
+                _ ->
+                    10000
+            end
+    end.
 
 trace_request(Req) ->
     case get(my_trace_flag) of
         true ->
             %%Avoid the binary operations if trace is not on...
-            NReq = binary_to_list(list_to_binary(Req)),
+            NReq = to_binary(Req),
             do_trace("Sending request: ~n"
                      "--- Request Begin ---~n~s~n"
                      "--- Request End ---~n", [NReq]);
         _ -> ok
     end.
 
-to_integer(X) when is_list(X)    -> list_to_integer(X); 
-to_integer(X) when is_integer(X) -> X.
+trace_request_body(Body) ->
+    case get(my_trace_flag) of
+        true ->
+            %%Avoid the binary operations if trace is not on...
+            NBody = to_binary(Body),
+            case size(NBody) > 1024 of
+                true ->
+                    ok;
+                false ->
+                    do_trace("Sending request body: ~n"
+                             "--- Request Body Begin ---~n~s~n"
+                             "--- Request Body End ---~n", [NBody])
+            end;
+        false ->
+            ok
+    end.
+
+to_binary(X) when is_list(X)   -> list_to_binary(X); 
+to_binary(X) when is_binary(X) -> X.

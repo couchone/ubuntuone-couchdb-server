@@ -11,15 +11,16 @@
 	 unit_tests/0,
 	 unit_tests/1,
 	 unit_tests_1/2,
-	 drv_ue_test/0,
-	 drv_ue_test/1,
 	 ue_test/0,
 	 ue_test/1,
 	 verify_chunked_streaming/0,
 	 verify_chunked_streaming/1,
+         test_chunked_streaming_once/0,
 	 i_do_async_req_list/4,
 	 test_stream_once/3,
-	 test_stream_once/4
+	 test_stream_once/4,
+         test_20122010/0,
+         test_20122010/1
 	]).
 
 test_stream_once(Url, Method, Options) ->
@@ -216,14 +217,20 @@ dump_errors(Key, Iod) ->
 		    {"http://jigsaw.w3.org/HTTP/300/", get},
 		    {"http://jigsaw.w3.org/HTTP/Basic/", get, [{basic_auth, {"guest", "guest"}}]},
 		    {"http://jigsaw.w3.org/HTTP/CL/", get},
-		    {"http://www.httpwatch.com/httpgallery/chunked/", get}
+		    {"http://www.httpwatch.com/httpgallery/chunked/", get},
+                    {"https://github.com", get, [{ssl_options, [{depth, 2}]}]},
+                    {local_test_fun, test_20122010, []}
 		   ]).
 
 unit_tests() ->
     unit_tests([]).
 
 unit_tests(Options) ->
+    application:start(crypto),
+    application:start(public_key),
     application:start(ssl),
+    (catch ibrowse_test_server:start_server(8181, tcp)),
+    ibrowse:start(),
     Options_1 = Options ++ [{connect_timeout, 5000}],
     {Pid, Ref} = erlang:spawn_monitor(?MODULE, unit_tests_1, [self(), Options_1]),
     receive 
@@ -237,7 +244,9 @@ unit_tests(Options) ->
     end.
 
 unit_tests_1(Parent, Options) ->
-    lists:foreach(fun({Url, Method}) ->
+    lists:foreach(fun({local_test_fun, Fun_name, Args}) ->
+                          execute_req(local_test_fun, Fun_name, Args);
+                     ({Url, Method}) ->
 			  execute_req(Url, Method, Options);
 		     ({Url, Method, X_Opts}) ->
 			  execute_req(Url, Method, X_Opts ++ Options)
@@ -248,19 +257,45 @@ verify_chunked_streaming() ->
     verify_chunked_streaming([]).
 
 verify_chunked_streaming(Options) ->
+    io:format("~nVerifying that chunked streaming is working...~n", []),
     Url = "http://www.httpwatch.com/httpgallery/chunked/",
-    io:format("URL: ~s~n", [Url]),
-    io:format("Fetching data without streaming...~n", []),
+    io:format("  URL: ~s~n", [Url]),
+    io:format("  Fetching data without streaming...~n", []),
     Result_without_streaming = ibrowse:send_req(
 				 Url, [], get, [],
 				 [{response_format, binary} | Options]),
-    io:format("Fetching data with streaming as list...~n", []),
+    io:format("  Fetching data with streaming as list...~n", []),
     Async_response_list = do_async_req_list(
 			    Url, get, [{response_format, list} | Options]),
-    io:format("Fetching data with streaming as binary...~n", []),
+    io:format("  Fetching data with streaming as binary...~n", []),
     Async_response_bin = do_async_req_list(
 			   Url, get, [{response_format, binary} | Options]),
-    compare_responses(Result_without_streaming, Async_response_list, Async_response_bin).
+    io:format("  Fetching data with streaming as binary, {active, once}...~n", []),
+    Async_response_bin_once = do_async_req_list(
+                                Url, get, [once, {response_format, binary} | Options]),
+    Res1 = compare_responses(Result_without_streaming, Async_response_list, Async_response_bin),
+    Res2 = compare_responses(Result_without_streaming, Async_response_list, Async_response_bin_once),
+    case {Res1, Res2} of
+        {success, success} ->
+            io:format("  Chunked streaming working~n", []);
+        _ ->
+            ok
+    end.
+
+test_chunked_streaming_once() ->
+    test_chunked_streaming_once([]).
+
+test_chunked_streaming_once(Options) ->
+    io:format("~nTesting chunked streaming with the {stream_to, {Pid, once}} option...~n", []),
+    Url = "http://www.httpwatch.com/httpgallery/chunked/",
+    io:format("  URL: ~s~n", [Url]),
+    io:format("  Fetching data with streaming as binary, {active, once}...~n", []),
+    case do_async_req_list(Url, get, [once, {response_format, binary} | Options]) of
+        {ok, _, _, _} ->
+            io:format("  Success!~n", []);
+        Err ->
+            io:format("  Fail: ~p~n", [Err])
+    end.
 
 compare_responses({ok, St_code, _, Body}, {ok, St_code, _, Body}, {ok, St_code, _, Body}) ->
     success;
@@ -296,7 +331,7 @@ do_async_req_list(Url, Method, Options) ->
     {Pid,_} = erlang:spawn_monitor(?MODULE, i_do_async_req_list,
 				   [self(), Url, Method, 
 				    Options ++ [{stream_chunk_size, 1000}]]),
-    io:format("Spawned process ~p~n", [Pid]),
+%%    io:format("Spawned process ~p~n", [Pid]),
     wait_for_resp(Pid).
 
 wait_for_resp(Pid) ->
@@ -313,33 +348,60 @@ wait_for_resp(Pid) ->
 	Msg ->
 	    io:format("Recvd unknown message: ~p~n", [Msg]),
 	    wait_for_resp(Pid)
-    after 10000 ->
+    after 100000 ->
 	  {error, timeout}
     end.
 
 i_do_async_req_list(Parent, Url, Method, Options) ->
-    Res = ibrowse:send_req(Url, [], Method, [], [{stream_to, self()} | Options]),
+    Options_1 = case lists:member(once, Options) of
+                    true ->
+                        [{stream_to, {self(), once}} | (Options -- [once])];
+                    false ->
+                        [{stream_to, self()} | Options]
+                end,
+    Res = ibrowse:send_req(Url, [], Method, [], Options_1),
     case Res of
 	{ibrowse_req_id, Req_id} ->
-	    Result = wait_for_async_resp(Req_id, undefined, undefined, []),
+	    Result = wait_for_async_resp(Req_id, Options, undefined, undefined, []),
 	    Parent ! {async_result, self(), Result};
 	Err ->
 	    Parent ! {async_result, self(), Err}
     end.
 
-wait_for_async_resp(Req_id, Acc_Stat_code, Acc_Headers, Body) ->
+wait_for_async_resp(Req_id, Options, Acc_Stat_code, Acc_Headers, Body) ->    
     receive
 	{ibrowse_async_headers, Req_id, StatCode, Headers} ->
-	    wait_for_async_resp(Req_id, StatCode, Headers, Body);
+            %% io:format("Recvd headers...~n", []),
+            maybe_stream_next(Req_id, Options),
+	    wait_for_async_resp(Req_id, Options, StatCode, Headers, Body);
 	{ibrowse_async_response_end, Req_id} ->
+            %% io:format("Recvd end of response.~n", []),
 	    Body_1 = list_to_binary(lists:reverse(Body)),
 	    {ok, Acc_Stat_code, Acc_Headers, Body_1};
 	{ibrowse_async_response, Req_id, Data} ->
-	    wait_for_async_resp(Req_id, Acc_Stat_code, Acc_Headers, [Data | Body]);
+            maybe_stream_next(Req_id, Options),
+            %% io:format("Recvd data...~n", []),
+	    wait_for_async_resp(Req_id, Options, Acc_Stat_code, Acc_Headers, [Data | Body]);
+	{ibrowse_async_response, Req_id, {error, _} = Err} ->
+            {ok, Acc_Stat_code, Acc_Headers, Err};
 	Err ->
 	    {ok, Acc_Stat_code, Acc_Headers, Err}
+    after 10000 ->
+            {timeout, Acc_Stat_code, Acc_Headers, Body}
     end.
 
+maybe_stream_next(Req_id, Options) ->
+    case lists:member(once, Options) of
+        true ->
+            ibrowse:stream_next(Req_id);
+        false ->
+            ok
+    end.
+
+execute_req(local_test_fun, Method, Args) ->
+    io:format("     ~-54.54w: ", [Method]),
+    Result = (catch apply(?MODULE, Method, Args)),
+    io:format("~p~n", [Result]);
 execute_req(Url, Method, Options) ->
     io:format("~7.7w, ~50.50s: ", [Method, Url]),
     Result = (catch ibrowse:send_req(Url, [], Method, [], Options)),
@@ -347,22 +409,8 @@ execute_req(Url, Method, Options) ->
 	{ok, SCode, _H, _B} ->
 	    io:format("Status code: ~p~n", [SCode]);
 	Err ->
-	    io:format("Err -> ~p~n", [Err])
+	    io:format("~p~n", [Err])
     end.
-
-drv_ue_test() ->
-    drv_ue_test(lists:duplicate(1024, 127)).
-drv_ue_test(Data) ->
-    [{port, Port}| _] = ets:lookup(ibrowse_table, port),
-%     erl_ddll:unload_driver("ibrowse_drv"),
-%     timer:sleep(1000),
-%     erl_ddll:load_driver("../priv", "ibrowse_drv"),
-%     Port = open_port({spawn, "ibrowse_drv"}, []),
-    {Time, Res} = timer:tc(ibrowse_lib, drv_ue, [Data, Port]),
-    io:format("Time -> ~p~n", [Time]),
-    io:format("Data Length -> ~p~n", [length(Data)]),
-    io:format("Res Length -> ~p~n", [length(Res)]).
-%    io:format("Result -> ~s~n", [Res]).
 
 ue_test() ->
     ue_test(lists:duplicate(1024, $?)).
@@ -376,3 +424,90 @@ ue_test(Data) ->
 log_msg(Fmt, Args) ->
     io:format("~s -- " ++ Fmt,
 	      [ibrowse_lib:printable_date() | Args]).
+
+%%------------------------------------------------------------------------------
+%% 
+%%------------------------------------------------------------------------------
+
+test_20122010() ->
+    test_20122010("http://localhost:8181").
+
+test_20122010(Url) ->
+    {ok, Pid} = ibrowse:spawn_worker_process(Url),
+    Expected_resp = <<"1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16-17-18-19-20-21-22-23-24-25-26-27-28-29-30-31-32-33-34-35-36-37-38-39-40-41-42-43-44-45-46-47-48-49-50-51-52-53-54-55-56-57-58-59-60-61-62-63-64-65-66-67-68-69-70-71-72-73-74-75-76-77-78-79-80-81-82-83-84-85-86-87-88-89-90-91-92-93-94-95-96-97-98-99-100">>,
+    Test_parent = self(),
+    Fun = fun() ->
+                  do_test_20122010(Url, Pid, Expected_resp, Test_parent)
+          end,
+    Pids = [erlang:spawn_monitor(Fun) || _ <- lists:seq(1,10)],
+    wait_for_workers(Pids).
+
+wait_for_workers([{Pid, _Ref} | Pids]) ->
+    receive
+        {Pid, success} ->
+            wait_for_workers(Pids)
+    after 60000 ->
+            test_failed
+    end;
+wait_for_workers([]) ->
+    success.
+
+do_test_20122010(Url, Pid, Expected_resp, Test_parent) ->
+    do_test_20122010(10, Url, Pid, Expected_resp, Test_parent).
+
+do_test_20122010(0, _Url, _Pid, _Expected_resp, Test_parent) ->
+    Test_parent ! {self(), success};
+do_test_20122010(Rem_count, Url, Pid, Expected_resp, Test_parent) ->
+    {ibrowse_req_id, Req_id} = ibrowse:send_req_direct(
+                                 Pid,
+                                 Url ++ "/ibrowse_stream_once_chunk_pipeline_test",
+                                 [], get, [],
+                                 [{stream_to, {self(), once}},
+                                  {inactivity_timeout, 10000},
+                                  {include_ibrowse_req_id, true}]),
+    do_trace("~p -- sent request ~1000.p~n", [self(), Req_id]),
+    Req_id_str = lists:flatten(io_lib:format("~1000.p",[Req_id])),
+    receive
+        {ibrowse_async_headers, Req_id, "200", Headers} ->
+            case lists:keysearch("x-ibrowse-request-id", 1, Headers) of
+                {value, {_, Req_id_str}} ->
+                    ok;
+                {value, {_, Req_id_1}} ->
+                    do_trace("~p -- Sent req-id: ~1000.p. Recvd: ~1000.p~n",
+                              [self(), Req_id, Req_id_1]),
+                    exit(req_id_mismatch)
+            end
+    after 5000 ->
+            do_trace("~p -- response headers not received~n", [self()]),
+            exit({timeout, test_failed})
+    end,
+    do_trace("~p -- response headers received~n", [self()]),
+    ok = ibrowse:stream_next(Req_id),
+    case do_test_20122010_1(Expected_resp, Req_id, []) of
+        true ->
+            do_test_20122010(Rem_count - 1, Url, Pid, Expected_resp, Test_parent);
+        false ->
+            Test_parent ! {self(), failed}
+    end.
+
+do_test_20122010_1(Expected_resp, Req_id, Acc) ->
+    receive
+        {ibrowse_async_response, Req_id, Body_part} ->
+            ok = ibrowse:stream_next(Req_id),
+            do_test_20122010_1(Expected_resp, Req_id, [Body_part | Acc]);
+        {ibrowse_async_response_end, Req_id} ->
+            Acc_1 = list_to_binary(lists:reverse(Acc)),
+            Result = Acc_1 == Expected_resp,
+            do_trace("~p -- End of response. Result: ~p~n", [self(), Result]),
+            Result
+    after 1000 ->
+            exit({timeout, test_failed})
+    end.
+
+do_trace(Fmt, Args) ->
+    do_trace(get(my_trace_flag), Fmt, Args).
+
+do_trace(true, Fmt, Args) ->
+    io:format("~s -- " ++ Fmt, [ibrowse_lib:printable_date() | Args]);
+do_trace(_, _, _) ->
+    ok.

@@ -6,9 +6,9 @@
 %%% Created : 11 Oct 2003 by Chandrashekhar Mullaparthi <chandrashekhar.mullaparthi@t-mobile.co.uk>
 %%%-------------------------------------------------------------------
 %% @author Chandrashekhar Mullaparthi <chandrashekhar dot mullaparthi at gmail dot com>
-%% @copyright 2005-2010 Chandrashekhar Mullaparthi
-%% @version 1.6.0
-%% @doc The ibrowse application implements an HTTP 1.1 client. This
+%% @copyright 2005-2011 Chandrashekhar Mullaparthi
+%% @version 2.1.3
+%% @doc The ibrowse application implements an HTTP 1.1 client in erlang. This
 %% module implements the API of the HTTP client. There is one named
 %% process called 'ibrowse' which assists in load balancing and maintaining configuration. There is one load balancing process per unique webserver. There is
 %% one process to handle one TCP connection to a webserver
@@ -87,6 +87,7 @@
          send_req_direct/6,
          send_req_direct/7,
          stream_next/1,
+         stream_close/1,
          set_max_sessions/3,
          set_max_pipeline_size/3,
          set_dest/3,
@@ -201,7 +202,11 @@ send_req(Url, Headers, Method, Body) ->
 %% dealing with large response bodies and/or slow links. In these
 %% cases, it might be hard to estimate how long a request will take to
 %% complete. In such cases, the client might want to timeout if no
-%% data has been received on the link for a certain time interval.</li>
+%% data has been received on the link for a certain time interval.
+%% 
+%% This value is also used to close connections which are not in use for 
+%% the specified timeout value.
+%% </li>
 %%
 %% <li>
 %% The <code>connect_timeout</code> option is to specify how long the
@@ -236,6 +241,11 @@ send_req(Url, Headers, Method, Body) ->
 %% caller to get access to the raw status line and raw unparsed
 %% headers. Not quite sure why someone would want this, but one of my
 %% users asked for it, so here it is. </li>
+%%
+%% <li> The <code>preserve_chunked_encoding</code> option enables the caller
+%% to receive the raw data stream when the Transfer-Encoding of the server
+%% response is Chunked.
+%% </li>
 %% </ul>
 %%
 %% @spec send_req(Url::string(), Headers::headerList(), Method::method(), Body::body(), Options::optionList()) -> response()
@@ -266,7 +276,8 @@ send_req(Url, Headers, Method, Body) ->
 %%          {socket_options, Sock_opts}        |
 %%          {transfer_encoding, {chunked, ChunkSize}} | 
 %%          {headers_as_is, boolean()}         |
-%%          {give_raw_headers, boolean()}
+%%          {give_raw_headers, boolean()}      |
+%%          {preserve_chunked_encoding,boolean()}
 %%
 %% stream_to() = process() | {process(), once}
 %% process() = pid() | atom()
@@ -302,23 +313,45 @@ send_req(Url, Headers, Method, Body, Options, Timeout) ->
             Options_1 = merge_options(Host, Port, Options),
             {SSLOptions, IsSSL} =
                 case (Protocol == https) orelse
-                     get_value(is_ssl, Options_1, false) of
+                    get_value(is_ssl, Options_1, false) of
                     false -> {[], false};
                     true -> {get_value(ssl_options, Options_1, []), true}
                 end,
-            case ibrowse_lb:spawn_connection(Lb_pid, Parsed_url,
-                                             Max_sessions, 
-                                             Max_pipeline_size,
-                                             {SSLOptions, IsSSL}) of
-                {ok, Conn_Pid} ->
-                    do_send_req(Conn_Pid, Parsed_url, Headers,
-                                Method, Body, Options_1, Timeout);
-                Err ->
-                    Err
-            end;
+            try_routing_request(Lb_pid, Parsed_url,
+                                Max_sessions, 
+                                Max_pipeline_size,
+                                {SSLOptions, IsSSL}, 
+                                Headers, Method, Body, Options_1, Timeout, 0);
         Err ->
             {error, {url_parsing_failed, Err}}
     end.
+
+try_routing_request(Lb_pid, Parsed_url,
+                    Max_sessions, 
+                    Max_pipeline_size,
+                    {SSLOptions, IsSSL}, 
+                    Headers, Method, Body, Options_1, Timeout, Try_count) when Try_count < 3 ->
+    case ibrowse_lb:spawn_connection(Lb_pid, Parsed_url,
+                                             Max_sessions, 
+                                             Max_pipeline_size,
+                                             {SSLOptions, IsSSL}) of
+        {ok, Conn_Pid} ->
+            case do_send_req(Conn_Pid, Parsed_url, Headers,
+                             Method, Body, Options_1, Timeout) of
+                {error, sel_conn_closed} ->
+                    try_routing_request(Lb_pid, Parsed_url,
+                                        Max_sessions, 
+                                        Max_pipeline_size,
+                                        {SSLOptions, IsSSL}, 
+                                        Headers, Method, Body, Options_1, Timeout, Try_count + 1);
+                Res ->
+                    Res
+            end;
+        Err ->
+            Err
+    end;
+try_routing_request(_, _, _, _, _, _, _, _, _, _, _) ->
+    {error, retry_later}.
 
 merge_options(Host, Port, Options) ->
     Config_options = get_config_value({options, Host, Port}, []),
@@ -337,11 +370,27 @@ get_lb_pid(Url) ->
 
 get_max_sessions(Host, Port, Options) ->
     get_value(max_sessions, Options,
-              get_config_value({max_sessions, Host, Port}, ?DEF_MAX_SESSIONS)).
+              get_config_value({max_sessions, Host, Port},
+                               default_max_sessions())).
 
 get_max_pipeline_size(Host, Port, Options) ->
     get_value(max_pipeline_size, Options,
-              get_config_value({max_pipeline_size, Host, Port}, ?DEF_MAX_PIPELINE_SIZE)).
+              get_config_value({max_pipeline_size, Host, Port},
+                               default_max_pipeline_size())).
+
+default_max_sessions() ->
+    safe_get_env(ibrowse, default_max_sessions, ?DEF_MAX_SESSIONS).
+
+default_max_pipeline_size() ->
+    safe_get_env(ibrowse, default_max_pipeline_size, ?DEF_MAX_PIPELINE_SIZE).
+
+safe_get_env(App, Key, Def_val) ->
+    case application:get_env(App, Key) of
+        undefined ->
+            Def_val;
+        {ok, Val} ->
+            Val
+    end.
 
 %% @doc Deprecated. Use set_max_sessions/3 and set_max_pipeline_size/3
 %% for achieving the same effect.
@@ -375,6 +424,10 @@ do_send_req(Conn_Pid, Parsed_url, Headers, Method, Body, Options, Timeout) ->
                                             Options, Timeout) of
         {'EXIT', {timeout, _}} ->
             {error, req_timedout};
+        {'EXIT', {noproc, {gen_server, call, [Conn_Pid, _, _]}}} ->
+            {error, sel_conn_closed};
+        {error, connection_closed} ->
+            {error, sel_conn_closed};
         {'EXIT', Reason} ->
             {error, {'EXIT', Reason}};
         {ok, St_code, Headers, Body} = Ret when is_binary(Body) ->
@@ -410,6 +463,8 @@ ensure_bin({Fun, _} = Body) when is_function(Fun) -> Body.
 spawn_worker_process(Url) ->
     ibrowse_http_client:start(Url).
 
+%% @doc Same as spawn_worker_process/1 but takes as input a Host and Port
+%% instead of a URL.
 %% @spec spawn_worker_process(Host::string(), Port::integer()) -> {ok, pid()}
 spawn_worker_process(Host, Port) ->
     ibrowse_http_client:start({Host, Port}).
@@ -420,6 +475,8 @@ spawn_worker_process(Host, Port) ->
 spawn_link_worker_process(Url) ->
     ibrowse_http_client:start_link(Url).
 
+%% @doc Same as spawn_worker_process/2 except the the calling process
+%% is linked to the worker process which is spawned.
 %% @spec spawn_link_worker_process(Host::string(), Port::integer()) -> {ok, pid()}
 spawn_link_worker_process(Host, Port) ->
     ibrowse_http_client:start_link({Host, Port}).
@@ -476,6 +533,21 @@ stream_next(Req_id) ->
             ok
     end.
 
+%% @doc Tell ibrowse to close the connection associated with the
+%% specified stream.  Should be used in conjunction with the
+%% <code>stream_to</code> option. Note that all requests in progress on
+%% the connection which is serving this Req_id will be aborted, and an
+%% error returned.
+%% @spec stream_close(Req_id :: req_id()) -> ok | {error, unknown_req_id}
+stream_close(Req_id) ->    
+    case ets:lookup(ibrowse_stream, {req_id_pid, Req_id}) of
+        [] ->
+            {error, unknown_req_id};
+        [{_, Pid}] ->
+            catch Pid ! {stream_close, Req_id},
+            ok
+    end.
+
 %% @doc Turn tracing on for the ibrowse process
 trace_on() ->
     ibrowse ! {trace, true}.
@@ -505,6 +577,9 @@ all_trace_off() ->
     ibrowse ! all_trace_off,
     ok.
 
+%% @doc Shows some internal information about load balancing. Info
+%% about workers spawned using spawn_worker_process/2 or
+%% spawn_link_worker_process/2 is not included.
 show_dest_status() ->
     Dests = lists:filter(fun({lb_pid, {Host, Port}, _}) when is_list(Host),
                                                              is_integer(Port) ->
@@ -608,16 +683,16 @@ init(_) ->
     State = #state{},
     put(my_trace_flag, State#state.trace),
     put(ibrowse_trace_token, "ibrowse"),
-    ets:new(ibrowse_lb, [named_table, public, {keypos, 2}]),
-    ets:new(ibrowse_conf, [named_table, protected, {keypos, 2}]),
-    ets:new(ibrowse_stream, [named_table, public]),
+    ibrowse_lb     = ets:new(ibrowse_lb, [named_table, public, {keypos, 2}]),
+    ibrowse_conf   = ets:new(ibrowse_conf, [named_table, protected, {keypos, 2}]),
+    ibrowse_stream = ets:new(ibrowse_stream, [named_table, public]),
     import_config(),
     {ok, #state{}}.
 
 import_config() ->
     case code:priv_dir(ibrowse) of
-        {error, _} = Err ->
-            Err;
+        {error, _} ->
+            ok;
         PrivDir ->
             Filename = filename:join(PrivDir, "ibrowse.conf"),
             import_config(Filename)
@@ -648,8 +723,8 @@ import_config(Filename) ->
                           io:format("Skipping unrecognised term: ~p~n", [X])
                   end,
             lists:foreach(Fun, Terms);
-        Err ->
-            Err
+        _Err ->
+            ok
     end.
 
 %% @doc Internal export
@@ -684,6 +759,10 @@ handle_call({get_lb_pid, #url{host = Host, port = Port} = Url}, _From, State) ->
 
 handle_call(stop, _From, State) ->
     do_trace("IBROWSE shutting down~n", []),
+    ets:foldl(fun(#lb_pid{pid = Pid}, Acc) ->
+                      ibrowse_lb:stop(Pid),
+                      Acc
+              end, [], ibrowse_lb),
     {stop, normal, ok, State};
 
 handle_call({set_config_value, Key, Val}, _From, State) ->
