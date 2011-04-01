@@ -13,7 +13,12 @@
 -module(couch_httpd_oauth).
 -include("couch_db.hrl").
 
--export([oauth_authentication_handler/1, handle_oauth_req/1, consumer_lookup/2]).
+-export([oauth_authentication_handler/1, handle_oauth_req/1]).
+-import(couch_util, [
+    get_value/2,
+    get_value/3,
+    to_binary/1
+]).
 
 -record(oauth_callback_params, {
     consumer,
@@ -217,11 +222,11 @@ serve_oauth(#httpd{mochi_req=MochiReq}=Req, Fun, FailSilently) ->
                     case get_oauth_callback_params(ConsumerKey, Params, Url) of
                         {ok, CallbackParams} ->
                             Fun(Req, CallbackParams);
-                        invalid_consumer ->
+                        invalid_consumer_token_pair ->
                             couch_httpd:send_error(
                                 Req, 400,
-                                <<"invalid_consumer">>,
-                                <<"Invalid consumer (key or signature method).">>);
+                                <<"invalid_consumer_token_pair">>,
+                                <<"Invalid consumer and token pair.">>);
                         {error, {Error, Reason}} ->
                             couch_httpd:send_error(Req, 400, Error, Reason)
                     end
@@ -231,43 +236,45 @@ serve_oauth(#httpd{mochi_req=MochiReq}=Req, Fun, FailSilently) ->
     end.
 
 get_oauth_callback_params(ConsumerKey, Params, Url) ->
-    Token = couch_util:get_value("oauth_token", Params),
+    Token = get_value("oauth_token", Params),
     SigMethod = sig_method(Params),
     CbParams0 = #oauth_callback_params{
         token = Token,
-        signature = couch_util:get_value("oauth_signature", Params),
+        signature = get_value("oauth_signature", Params),
         params = proplists:delete("oauth_signature", Params),
         url = Url
     },
     case couch_auth_cache:get_user_creds({ConsumerKey, Token}) of
     nil ->
-        case consumer_key_secret(ConsumerKey) of
-        undefined ->
-            invalid_consumer;
+        case oauth_credentials_info(Token, ConsumerKey) of
+        nil ->
+            invalid_consumer_token_pair;
         {error, _} = Err ->
             Err;
-        ConsumerSecret ->
-            case access_token_info(Token) of
-            {error, _} = Err ->
-                Err;
-            [undefined, undefined | _] ->
-                CbParams = CbParams0#oauth_callback_params{
-                    consumer = {ConsumerKey, ConsumerSecret, SigMethod}
-                },
-                {ok, CbParams};
-            [TokenSecret, User1 | Rest] ->
-                User = ?l2b(User1),
-                {Roles, DelegationDb} = case Rest of
-                [] ->
+        {OauthCreds} ->
+            User = get_value(<<"username">>, OauthCreds),
+            ConsumerSecret = as_list(get_value(<<"consumer_secret">>, OauthCreds)),
+            TokenSecret = as_list(get_value(<<"token_secret">>, OauthCreds)),
+            case (User =:= undefined) orelse (ConsumerSecret =:= undefined) orelse
+                 (TokenSecret =:= undefined) of
+            true ->
+                 invalid_consumer_token_pair;
+            false ->
+                case get_value(<<"delegation_db">>, OauthCreds, nil) of
+                nil ->
                     case couch_auth_cache:get_user_creds(User) of
                     nil ->
-                        {undefined, undefined};
+                        Roles = undefined,
+                        DelegationDb = undefined;
                     UserCreds ->
-                        {couch_util:get_value(<<"roles">>, UserCreds, []), undefined}
+                        Roles = get_value(<<"roles">>, UserCreds, []),
+                        DelegationDb = undefined
                     end;
-                [DelegatedRoles, Db, DelegatorUser] ->
+                Db ->
+                    Roles = get_value(<<"delegation_roles">>, OauthCreds),
+                    DelegatorUser = get_value(<<"delegator">>, OauthCreds),
                     UserPrefix = couch_httpd_auth:username_to_prefix(DelegatorUser),
-                    {DelegatedRoles, <<UserPrefix/binary, Db/binary>>}
+                    DelegationDb = <<UserPrefix/binary, Db/binary>>
                 end,
                 CbParams = CbParams0#oauth_callback_params{
                     consumer = {ConsumerKey, ConsumerSecret, SigMethod},
@@ -276,10 +283,11 @@ get_oauth_callback_params(ConsumerKey, Params, Url) ->
                     roles = Roles,
                     database = DelegationDb
                 },
-                ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~s and Token ~s, "
-                    "from the views, User: ~s, Roles: ~p, ConsumerSecret: ~s, "
-                    "TokenSecret: ~s, DelegationDb: ~s",
-                    [ConsumerKey, Token, User, Roles, ConsumerSecret, TokenSecret, DelegationDb]),
+                ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~p and Token ~p, "
+                           "from the views, User: ~p, Roles: ~p, ConsumerSecret: ~p, "
+                           "TokenSecret: ~p, DelegationDb: ~p",
+                           [ConsumerKey, Token, User, Roles, ConsumerSecret,
+                            TokenSecret, DelegationDb]),
                 ok = couch_auth_cache:add_oauth_creds(
                     {ConsumerKey, Token},
                     {User, Roles, DelegationDb, ConsumerSecret, TokenSecret}),
@@ -287,10 +295,10 @@ get_oauth_callback_params(ConsumerKey, Params, Url) ->
             end
         end;
     {UserName, Roles, DelegationDb, ConsumerSecret, TokenSecret} ->
-        ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~s and Token ~s, "
-            "from cache, User: ~s, Roles: ~p, ConsumerSecret: ~s, "
-            "TokenSecret: ~s, DelegationDb: ~s",
-            [ConsumerKey, Token, UserName, Roles, ConsumerSecret, TokenSecret, DelegationDb]),
+        ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~p and Token ~p, "
+                   "from cache, User: ~p, Roles: ~p, ConsumerSecret: ~p, "
+                   "TokenSecret: ~p, DelegationDb: ~p",
+                   [ConsumerKey, Token, UserName, Roles, ConsumerSecret, TokenSecret, DelegationDb]),
         CbParams = CbParams0#oauth_callback_params{
             consumer = {ConsumerKey, ConsumerSecret, SigMethod},
             token_secret = TokenSecret,
@@ -299,15 +307,6 @@ get_oauth_callback_params(ConsumerKey, Params, Url) ->
             database = DelegationDb
         },
         {ok, CbParams}
-    end.
-
-consumer_lookup(_Key, undefined) ->
-    none;
-consumer_lookup(Key, SignatureMethod) ->
-    case consumer_key_secret(Key) of
-        undefined -> none;
-        {error, _} = Err -> Err;
-        Secret -> {Key, Secret, SignatureMethod}
     end.
 
 sig_method(Params) ->
@@ -327,54 +326,39 @@ ok(#httpd{mochi_req=MochiReq}, Body) ->
 
 -define(DDOC_ID, <<"_design/oauth">>).
 
-consumer_key_secret(Key) ->
+oauth_credentials_info(Token, ConsumerKey) ->
     case use_auth_db() of
     {ok, Db} ->
-        Secret =
-        case query_map_view(Db, ?DDOC_ID, <<"consumer_key_secret">>, Key) of
+        case query_map_view(
+            Db, ?DDOC_ID, <<"oauth_credentials">>, [?l2b(ConsumerKey), ?l2b(Token)]) of
         [] ->
-            undefined;
-        [Sec] ->
-            ?b2l(Sec);
-        Secs ->
+            nil;
+        [Creds] ->
+            Creds;
+        [_ | _] ->
             Reason = iolist_to_binary(
-                io_lib:format("Can't map OAuth consumer key ~s to a single user "
-                    "document. It is referenced by ~p user documents.",
-                    [Key, length(Secs)])),
-            ?LOG_ERROR("~s", [Reason]),
-            {error, {<<"oauth_consumer_key">>, Reason}}
-        end,
-        couch_db:close(Db),
-        Secret;
+                io_lib:format("Found multiple OAuth credentials for the pair "
+                              " (consumer_key: `~s`, token: `~s`)",
+                              [to_binary(ConsumerKey), to_binary(Token)])),
+            {error, {<<"oauth_token_consumer_key_pair">>, Reason}}
+        end;
     nil ->
-        couch_config:get("oauth_consumer_secrets", Key)
-    end.
-
-access_token_info(Token) ->
-    case use_auth_db() of
-    {ok, Db} ->
-        Info =
-        case query_map_view(Db, ?DDOC_ID, <<"access_token_info">>, Token) of
-        [] ->
-            [undefined, undefined];
-        [[TokenSecret, Username | Rest]] ->
-            [?b2l(TokenSecret), ?b2l(Username) | Rest];
-        Secrets ->
-            UserList = [?b2l(U) || [_, U | _] <- Secrets],
-            Reason = iolist_to_binary(
-                io_lib:format("Can't map OAuth token ~s to a single user "
-                    "document. It is mapped to the following users: ~s.",
-                    [Token, string:join(UserList, ", ")])),
-            ?LOG_ERROR("~s", [Reason]),
-            {error, {<<"oauth_token">>, Reason}}
-        end,
-        couch_db:close(Db),
-        Info;
-    nil ->
-        [
-            couch_config:get("oauth_token_secrets", Token),
-            couch_config:get("oauth_token_users", Token)
-        ]
+        {
+            case couch_config:get("oauth_consumer_secrets", ConsumerKey) of
+            undefined -> [];
+            ConsumerSecret -> [{<<"consumer_secret">>, ?l2b(ConsumerSecret)}]
+            end
+            ++
+            case couch_config:get("oauth_token_secrets", Token) of
+            undefined -> [];
+            TokenSecret -> [{<<"token_secret">>, ?l2b(TokenSecret)}]
+            end
+            ++
+            case couch_config:get("oauth_token_users", Token) of
+            undefined -> [];
+            User -> [{<<"username">>, ?l2b(User)}]
+            end
+        }
     end.
 
 use_auth_db() ->
@@ -408,14 +392,9 @@ get_oauth_ddoc() ->
         {<<"language">>, <<"javascript">>},
         {<<"views">>,
             {[
-                {<<"consumer_key_secret">>,
+                {<<"oauth_credentials">>,
                     {[
-                        {<<"map">>, consumer_key_secret_map_fun()}
-                    ]}
-                },
-                {<<"access_token_info">>,
-                    {[
-                        {<<"map">>, access_token_info_map_fun()}
+                        {<<"map">>, oauth_creds_map_fun()}
                     ]}
                 }
             ]}
@@ -423,56 +402,62 @@ get_oauth_ddoc() ->
     ]},
     {ok, couch_doc:from_json_obj(Json)}.
 
-consumer_key_secret_map_fun() ->
-    % map results =>  key: consumer_key, value: consumer_secret
+oauth_creds_map_fun() ->
+    % map key is like [consumer_key, access_token]
+    % map value is like
+    %     {
+    %         "consumer_secret": "foo",
+    %         "token_secret": "bar",
+    %         "username": "joe",
+    %         "delegation_db": "databasename"
+    %         "delegation_roles": ["foo", "bar"],
+    %         "delegator": "username of the delegator user"
+    %     }
+    %
+    % NOTE: delegation_db, delegation_roles and delegator are only defined if
+    %       the entry corresponds to an oauth delegation
     <<"
         function(doc) {
             if (doc.type === 'user' && doc.oauth && doc.oauth.consumer_keys) {
-                for (var consumer_key in doc.oauth.consumer_keys) {
-                    emit(consumer_key, doc.oauth.consumer_keys[consumer_key]);
-                }
-                var dels = doc.delegations || [];
-                for (var i = 0; i < dels.length; i++) {
-                    emit(dels[i].oauth.consumer_key,
-                        dels[i].oauth.consumer_secret);
-                }
-            }
-        }
-    ">>.
 
-access_token_info_map_fun() ->
-    % map results =>
-    %     key: access_token,
-    %     value: [access_token_secret, username] ||
-    %            [access_token_secret, delegation_username,
-    %                delegation_roles, delegation_database, delegator_user]
-    % (username == resource owner in OAuth's jargon)
-    % (For 2-legged OAuth the consumer is the same as the resource owner)
-    <<"
-        function(doc) {
-            if (doc.type === 'user' && doc.oauth && doc.oauth.tokens) {
-                for (var token in doc.oauth.tokens) {
-                    emit(token, [doc.oauth.tokens[token], doc.name]);
+                for (var consumer_key in doc.oauth.consumer_keys) {
+                    for (var token in doc.oauth.tokens) {
+                        var obj = {
+                            'consumer_secret': doc.oauth.consumer_keys[consumer_key],
+                            'token_secret': doc.oauth.tokens[token],
+                            'username': doc.name
+                        };
+                        emit([consumer_key, token], obj);
+                    }
                 }
+
                 var dels = doc.delegations || [];
-                var del_name, del_roles, db;
                 for (var i = 0; i < dels.length; i++) {
-                    db = dels[i].database;
-                    del_name = dels[i].name + '.delegated.' + db;
-                    del_roles = dels[i].roles || [];
+                    if ((typeof dels[i].oauth !== 'object') || (dels[i].oauth === null)) {
+                        log('Missing oauth property for delegation index ' + i +
+                            ' in user `' + doc.name + '` document.');
+                        continue;
+                    }
+                    var db = dels[i].database;
+                    var del_roles = dels[i].roles || [];
                     for (var r = 0; r < del_roles.length; r++) {
                         del_roles[r] = del_roles[r] + '.delegated.' + db;
                     }
-                    emit(dels[i].oauth.token,
-                        [dels[i].oauth.token_secret,
-                            del_name, del_roles, db, doc.name]);
+                    var obj = {
+                        'consumer_secret': dels[i].oauth.consumer_secret,
+                        'token_secret': dels[i].oauth.token_secret,
+                        'username': dels[i].name + '.delegated.' + dels[i].database,
+                        'delegation_db': dels[i].database,
+                        'delegation_roles': del_roles,
+                        'delegator': doc.name
+                    };
+                    emit([dels[i].oauth.consumer_key, dels[i].oauth.token], obj);
                 }
             }
         }
     ">>.
 
-query_map_view(Db, DesignId, ViewName, Key1) ->
-    Key = ?l2b(Key1),
+query_map_view(Db, DesignId, ViewName, Key) ->
     {ok, View, _Group} = couch_view:get_map_view(Db, DesignId, ViewName, nil),
     FoldlFun = fun({_Key_DocId, Value}, _, Acc) ->
         {ok, [Value | Acc]}
@@ -484,6 +469,14 @@ query_map_view(Db, DesignId, ViewName, Key1) ->
     case couch_view:fold(View, FoldlFun, [], ViewOptions) of
     {ok, _, Result} ->
         Result;
-    _ ->
+    Error ->
+        ?LOG_ERROR("Warning: error querying map view `~s` (design document `~s`): ~s"
+                   "~nReturning empty result set.",
+                   [to_binary(ViewName), to_binary(DesignId), to_binary(Error)]),
         []
     end.
+
+as_list(undefined) ->
+    undefined;
+as_list(B) when is_binary(B) ->
+    ?b2l(B).

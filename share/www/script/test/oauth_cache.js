@@ -407,7 +407,7 @@ couchTests.oauth_cache = function(debug) {
       fdmanana_oauth_msg, fdmanana_oauth_accessor);
     TEquals(400, xhr.status);
     data = JSON.parse(xhr.responseText);
-    TEquals("invalid_consumer", data.error);
+    TEquals("invalid_consumer_token_pair", data.error);
 
     hits_after = hits();
     misses_after = misses();
