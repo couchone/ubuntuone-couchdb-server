@@ -322,9 +322,6 @@ couchTests.oauth_delegation = function(debug) {
       admins: {
         names: ["fdmanana"],
         roles: ["qwerty", "cooker.delegated.twitter_token_1"]
-      },
-      readers: {
-        names: ["twitter.delegated.test_db"]
       }
     };
     xhr = oauthRequest(
