@@ -29,7 +29,7 @@
     params,
     username,
     roles,
-    database
+    databases
 }).
 
 % OAuth auth handler using per-node user db
@@ -50,11 +50,11 @@ oauth_auth_callback(#httpd{mochi_req = MochiReq} = Req, CbParams) ->
         params = Params,
         username = User,
         roles = Roles,
-        database = DelegationDb
+        databases = DelegationDbs
     } = CbParams,
     case oauth:verify(Sig, Method, Url, Params, Consumer, TokenSecret) of
     true ->
-        set_user_ctx(Req, User, Roles, DelegationDb);
+        set_user_ctx(Req, User, Roles, DelegationDbs);
     false ->
         ?LOG_DEBUG("OAuth handler: signature verification failed for user ~p",
             [User]),
@@ -70,7 +70,7 @@ oauth_auth_callback(#httpd{mochi_req = MochiReq} = Req, CbParams) ->
     end.
 
 % Look up the consumer key and get the roles to give the consumer
-set_user_ctx(_Req, undefined, _DelegationRoles, _DelegationDb) ->
+set_user_ctx(_Req, undefined, _DelegationRoles, _DelegationDbs) ->
     throw({bad_request, unknown_oauth_token});
 set_user_ctx(Req, Name, undefined, undefined) ->
     case couch_auth_cache:get_user_creds(Name) of
@@ -81,17 +81,17 @@ set_user_ctx(Req, Name, undefined, undefined) ->
             Roles = couch_util:get_value(<<"roles">>, User, []),
             Req#httpd{user_ctx=#user_ctx{name=Name, roles=Roles}}
     end;
-set_user_ctx(Req, Name, DelegationRoles, DelegationDb) ->
+set_user_ctx(Req, Name, DelegationRoles, DelegationDbs) ->
     ?LOG_DEBUG("Setting delegated oauth user_ctx, username: ~p, "
-        "roles: ~p, database: ~p", [Name, DelegationRoles, DelegationDb]),
+        "roles: ~p, databases: ~p", [Name, DelegationRoles, DelegationDbs]),
     Req#httpd{user_ctx = #user_ctx{
         name = Name,
         roles = DelegationRoles,
-        delegated_databases = case DelegationDb of
+        delegated_databases = case DelegationDbs of
             undefined ->
                 null;
             _ ->
-                [DelegationDb]
+                DelegationDbs
             end
     }}.
 
@@ -260,51 +260,50 @@ get_oauth_callback_params(ConsumerKey, Params, Url) ->
             true ->
                  invalid_consumer_token_pair;
             false ->
-                case get_value(<<"delegation_db">>, OauthCreds, nil) of
+                case get_value(<<"delegation_dbs">>, OauthCreds, nil) of
                 nil ->
+                    DelegationDbs = undefined,
                     case couch_auth_cache:get_user_creds(User) of
                     nil ->
-                        Roles = undefined,
-                        DelegationDb = undefined;
+                        Roles = undefined;
                     UserCreds ->
-                        Roles = get_value(<<"roles">>, UserCreds, []),
-                        DelegationDb = undefined
+                        Roles = get_value(<<"roles">>, UserCreds, [])
                     end;
-                Db ->
+                DbList ->
                     Roles = get_value(<<"delegation_roles">>, OauthCreds),
                     DelegatorUser = get_value(<<"delegator">>, OauthCreds),
                     UserPrefix = couch_httpd_auth:username_to_prefix(DelegatorUser),
-                    DelegationDb = <<UserPrefix/binary, Db/binary>>
+                    DelegationDbs = [<<UserPrefix/binary, Db/binary>> || Db <- DbList]
                 end,
                 CbParams = CbParams0#oauth_callback_params{
                     consumer = {ConsumerKey, ConsumerSecret, SigMethod},
                     token_secret = TokenSecret,
                     username = User,
                     roles = Roles,
-                    database = DelegationDb
+                    databases = DelegationDbs
                 },
                 ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~p and Token ~p, "
                            "from the views, User: ~p, Roles: ~p, ConsumerSecret: ~p, "
-                           "TokenSecret: ~p, DelegationDb: ~p",
+                           "TokenSecret: ~p, DelegationDbs: ~p",
                            [ConsumerKey, Token, User, Roles, ConsumerSecret,
-                            TokenSecret, DelegationDb]),
+                            TokenSecret, DelegationDbs]),
                 ok = couch_auth_cache:add_oauth_creds(
                     {ConsumerKey, Token},
-                    {User, Roles, DelegationDb, ConsumerSecret, TokenSecret}),
+                    {User, Roles, DelegationDbs, ConsumerSecret, TokenSecret}),
                 {ok, CbParams}
             end
         end;
-    {UserName, Roles, DelegationDb, ConsumerSecret, TokenSecret} ->
+    {UserName, Roles, DelegationDbs, ConsumerSecret, TokenSecret} ->
         ?LOG_DEBUG("Got OAuth credentials, for ConsumerKey ~p and Token ~p, "
                    "from cache, User: ~p, Roles: ~p, ConsumerSecret: ~p, "
-                   "TokenSecret: ~p, DelegationDb: ~p",
-                   [ConsumerKey, Token, UserName, Roles, ConsumerSecret, TokenSecret, DelegationDb]),
+                   "TokenSecret: ~p, DelegationDbs: ~p",
+                   [ConsumerKey, Token, UserName, Roles, ConsumerSecret, TokenSecret, DelegationDbs]),
         CbParams = CbParams0#oauth_callback_params{
             consumer = {ConsumerKey, ConsumerSecret, SigMethod},
             token_secret = TokenSecret,
             username = UserName,
             roles = Roles,
-            database = DelegationDb
+            databases = DelegationDbs
         },
         {ok, CbParams}
     end.
@@ -409,12 +408,12 @@ oauth_creds_map_fun() ->
     %         "consumer_secret": "foo",
     %         "token_secret": "bar",
     %         "username": "joe",
-    %         "delegation_db": "databasename"
+    %         "delegation_dbs": ["database1name", "database2name", ...],
     %         "delegation_roles": ["foo", "bar"],
     %         "delegator": "username of the delegator user"
     %     }
     %
-    % NOTE: delegation_db, delegation_roles and delegator are only defined if
+    % NOTE: delegation_dbs, delegation_roles and delegator are only defined if
     %       the entry corresponds to an oauth delegation
     <<"
         function(doc) {
@@ -446,7 +445,7 @@ oauth_creds_map_fun() ->
                         'consumer_secret': dels[i].oauth.consumer_secret,
                         'token_secret': dels[i].oauth.token_secret,
                         'username': dels[i].name + '.delegated.' + dels[i].oauth.token,
-                        'delegation_db': dels[i].database,
+                        'delegation_dbs': dels[i].databases,
                         'delegation_roles': del_roles,
                         'delegator': doc.name
                     };

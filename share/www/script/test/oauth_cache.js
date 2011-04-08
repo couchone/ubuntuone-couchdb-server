@@ -85,7 +85,7 @@ couchTests.oauth_cache = function(debug) {
     },
     delegations: [
       {
-        "database": "test_db",
+        "databases": ["test_db"],
         "description": "test",
         "name": "fil",
         "roles": ["cooker", "foo"],

@@ -46,9 +46,10 @@
 
 -type oauth_pair() :: {ConsumerKey :: string(), Token :: string()}.
 -type roles() :: [binary()].
+-type databases() :: [binary()].
 -spec get_user_creds(UserName::string() | binary() | oauth_pair()) ->
     Credentials::list() |
-    {UserName::binary(), UserRoles::roles(), DelegationDb::binary(),
+    {UserName::binary(), UserRoles::roles(), DelegationDbs::databases(),
         ConsumerSecret::string(), TokenSecret::string()} |
     nil.
 

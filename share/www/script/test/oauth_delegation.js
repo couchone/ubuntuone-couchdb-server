@@ -77,7 +77,7 @@ couchTests.oauth_delegation = function(debug) {
     },
     delegations: [
       {
-        "database": "test_db",
+        "databases": ["test_db"],
         "description": "test",
         "name": "twitter",
         "roles": ["cooker", "foo"],
@@ -203,7 +203,7 @@ couchTests.oauth_delegation = function(debug) {
 
     user_doc.delegations = [
       {
-        "database": "test_db",
+        "databases": ["test_db"],
         "description": "test",
         "name": "twitter",
         "roles": ["cooker", "foo"],
