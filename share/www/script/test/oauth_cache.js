@@ -323,7 +323,7 @@ couchTests.oauth_cache = function(debug) {
     TEquals(200, xhr.status);
     data = JSON.parse(xhr.responseText);
     TEquals(true, data.ok);
-    TEquals("fil.delegated.test_db", data.userCtx.name);
+    TEquals("fil.delegated.fil_token", data.userCtx.name);
 
     hits_after = hits();
     misses_after = misses();
@@ -340,7 +340,7 @@ couchTests.oauth_cache = function(debug) {
     TEquals(200, xhr.status);
     data = JSON.parse(xhr.responseText);
     TEquals(true, data.ok);
-    TEquals("fil.delegated.test_db", data.userCtx.name);
+    TEquals("fil.delegated.fil_token", data.userCtx.name);
 
     hits_after = hits();
     misses_after = misses();

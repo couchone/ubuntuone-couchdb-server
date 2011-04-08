@@ -245,11 +245,11 @@ couchTests.oauth_delegation = function(debug) {
     data = JSON.parse(xhr.responseText);
     TEquals(true, data.ok);
     TEquals("object", typeof data.userCtx);
-    TEquals("twitter.delegated.test_db", data.userCtx.name);
+    TEquals("twitter.delegated.twitter_token_1", data.userCtx.name);
     TEquals(true, data.userCtx.roles instanceof Array);
     TEquals(2, data.userCtx.roles.length);
-    TEquals("cooker.delegated.test_db", data.userCtx.roles[0]);
-    TEquals("foo.delegated.test_db", data.userCtx.roles[1]);
+    TEquals("cooker.delegated.twitter_token_1", data.userCtx.roles[0]);
+    TEquals("foo.delegated.twitter_token_1", data.userCtx.roles[1]);
     TEquals("oauth", data.info.authenticated);
 
     // check if the delegated user Twitter can access fdmanana's database

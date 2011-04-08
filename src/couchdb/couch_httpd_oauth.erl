@@ -438,15 +438,14 @@ oauth_creds_map_fun() ->
                             ' in user `' + doc.name + '` document.');
                         continue;
                     }
-                    var db = dels[i].database;
                     var del_roles = dels[i].roles || [];
                     for (var r = 0; r < del_roles.length; r++) {
-                        del_roles[r] = del_roles[r] + '.delegated.' + db;
+                        del_roles[r] = del_roles[r] + '.delegated.' + dels[i].oauth.token;
                     }
                     var obj = {
                         'consumer_secret': dels[i].oauth.consumer_secret,
                         'token_secret': dels[i].oauth.token_secret,
-                        'username': dels[i].name + '.delegated.' + dels[i].database,
+                        'username': dels[i].name + '.delegated.' + dels[i].oauth.token,
                         'delegation_db': dels[i].database,
                         'delegation_roles': del_roles,
                         'delegator': doc.name
