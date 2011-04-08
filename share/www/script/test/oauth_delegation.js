@@ -311,21 +311,29 @@ couchTests.oauth_delegation = function(debug) {
       _id: "_design/twitter",
       value: "ddoc"
     };
-//     xhr = oauthRequest(
-//       "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
-//         "/" + new_doc._id,
-//       twitter_oauth_msg, twitter_oauth_accessor, JSON.stringify(new_doc));
-//     TEquals(401, xhr.status);
+    xhr = oauthRequest(
+      "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
+        "/" + new_doc._id,
+      twitter_oauth_msg, twitter_oauth_accessor, JSON.stringify(new_doc));
+    TEquals(401, xhr.status);
 
     // now add one of twitter's roles into the security object of the database
-//     sec_obj.admins.roles = ["qwerty", "cooker.delegated.test_db"];
-//     xhr = oauthRequest(
-//       "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
-//         "/_security",
-//       oauth_msg, oauth_accessor, JSON.stringify(sec_obj));
-//     TEquals(200, xhr.status);
-//     data = JSON.parse(xhr.responseText);
-//     TEquals(true, data.ok);
+    var sec_obj = {
+      admins: {
+        names: ["fdmanana"],
+        roles: ["qwerty", "cooker.delegated.twitter_token_1"]
+      },
+      readers: {
+        names: ["twitter.delegated.test_db"]
+      }
+    };
+    xhr = oauthRequest(
+      "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +
+        "/_security",
+      oauth_msg, oauth_accessor, JSON.stringify(sec_obj));
+    TEquals(200, xhr.status);
+    data = JSON.parse(xhr.responseText);
+    TEquals(true, data.ok);
 
     xhr = oauthRequest(
       "PUT", "http://" + host + "/" + encDbPath("fdmanana", "test_db") +

@@ -268,19 +268,7 @@ get_design_docs(#db{fulldocinfo_by_id_btree=Btree}=Db) ->
         [], [{start_key, <<"_design/">>}, {end_key_gt, <<"_design0">>}]),
     {ok, Docs}.
 
-check_is_admin(#db{name = Name,
-    user_ctx = #user_ctx{delegated_databases = DelegatedDbs}} = Db)
-        when is_list(DelegatedDbs) ->
-    case lists:member(Name, DelegatedDbs) of
-    true ->
-        ok;
-    false ->
-        check_is_admin_int(Db)
-    end;
-check_is_admin(Db) ->
-    check_is_admin_int(Db).
-
-check_is_admin_int(#db{user_ctx=#user_ctx{name=Name,roles=Roles}}=Db) ->
+check_is_admin(#db{user_ctx=#user_ctx{name=Name,roles=Roles}}=Db) ->
     {Admins} = get_admins(Db),
     AdminRoles = [<<"_admin">> | couch_util:get_value(<<"roles">>, Admins, [])],
     AdminNames = couch_util:get_value(<<"names">>, Admins,[]),
@@ -296,7 +284,19 @@ check_is_admin_int(#db{user_ctx=#user_ctx{name=Name,roles=Roles}}=Db) ->
         ok
     end.
 
-check_is_reader(#db{user_ctx=#user_ctx{name=Name,roles=Roles}=UserCtx}=Db) ->
+check_is_reader(#db{name = Name,
+    user_ctx = #user_ctx{delegated_databases = DelegatedDbs}} = Db)
+        when is_list(DelegatedDbs) ->
+    case lists:member(Name, DelegatedDbs) of
+    true ->
+        ok;
+    false ->
+        check_is_reader_int(Db)
+    end;
+check_is_reader(Db) ->
+    check_is_reader_int(Db).
+
+check_is_reader_int(#db{user_ctx=#user_ctx{name=Name,roles=Roles}=UserCtx}=Db) ->
     case (catch check_is_admin(Db)) of
     ok -> ok;
     _ ->
